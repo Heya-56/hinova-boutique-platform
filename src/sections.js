@@ -2,6 +2,7 @@
 import { esc, fmtXpf } from './lib.js';
 import { illu, illuFor, ILLUS } from './art.js';
 import { PAYMENT_METHODS, ISLANDS } from './plans.js';
+import { isSafeImage } from './photos.js';
 
 export const MAX_SECTIONS = 12;
 
@@ -10,7 +11,8 @@ export const SECTION_TYPES = {
   annonce:   { label: 'Bandeau d’annonce', fields: [{ k: 'texte', label: 'Texte', max: 120 }] },
   hero:      { label: 'Bannière d’accueil', fields: [
     { k: 'titre', label: 'Titre', max: 80 }, { k: 'texte', label: 'Texte', max: 240, area: true },
-    { k: 'bouton', label: 'Texte du bouton', max: 30 }, { k: 'motif', label: 'Illustration', options: ILLUS }] },
+    { k: 'bouton', label: 'Texte du bouton', max: 30 }, { k: 'motif', label: 'Illustration', options: ILLUS },
+    { k: 'image', label: 'Photo', max: 300, image: true, hidden: true }] },
   produits:  { label: 'Produits et commande', unique: true, required: true, fields: [{ k: 'titre', label: 'Titre', max: 60 }] },
   texte:     { label: 'Texte (notre histoire)', fields: [{ k: 'titre', label: 'Titre', max: 80 }, { k: 'texte', label: 'Texte', max: 1200, area: true }] },
   avantages: { label: 'Points forts', fields: [{ k: 'titre', label: 'Titre', max: 60 }],
@@ -54,6 +56,7 @@ export function sanitizeSections(input) {
     for (const f of def.fields) {
       let v = String(raw[f.k] ?? '').slice(0, f.max ?? 40);
       if (f.options && !f.options.includes(v)) v = f.options[0];
+      if (f.image && !isSafeImage(v)) v = '';
       s[f.k] = v;
     }
     if (def.items) {
@@ -78,9 +81,9 @@ export function parseSections(json, b) {
 const para = (t) => esc(t).replace(/\n/g, '<br>');
 
 function productCard(o, ctx) {
-  const visual = o.image_url
-    ? `<img src="${esc(o.image_url)}" alt="${esc(o.nom)}" loading="lazy">`
-    : illu(o.illu || illuFor(o.id), ctx.primary, ctx.secondary, o.nom);
+  // L'illustration reste dessous : si la photo ne charge pas, elle s'efface et l'illustration apparaît.
+  const visual = illu(o.illu || illuFor(o.id), ctx.primary, ctx.secondary, o.nom)
+    + (o.image_url ? `<img src="${esc(o.image_url)}" alt="${esc(o.nom)}" loading="lazy" onerror="this.remove()">` : '');
   const orderable = o.stock > 0 && ctx.canOrder;
   return `<article class="card-p">
     <div class="ph">${visual}</div>
@@ -126,7 +129,7 @@ const RENDER = {
   hero: (s, ctx) => `<section class="s s-hero"><div class="wrap hero-grid">
       <div><h1>${esc(s.titre || ctx.b.nom)}</h1>${s.texte ? `<p>${para(s.texte)}</p>` : ''}
       ${s.bouton ? `<a class="btn btn-on" href="#produits">${esc(s.bouton)}</a>` : ''}</div>
-      <div class="hero-art">${illu(s.motif || 'vague', ctx.primary, ctx.secondary, '')}</div></div></section>`,
+      <div class="hero-art${s.image ? ' photo' : ''}">${illu(s.motif || 'vague', ctx.primary, ctx.secondary, '')}${s.image ? `<img src="${esc(s.image)}" alt="" onerror="this.remove()">` : ''}</div></div></section>`,
   produits: (s, ctx) => `<section class="s s-produits" id="produits"><div class="wrap">
       ${s.titre ? `<h2>${esc(s.titre)}</h2>` : ''}
       ${ctx.offres.length ? `<div class="grid-p">${ctx.offres.map((o) => productCard(o, ctx)).join('')}</div>` : '<p class="muted">La collection arrive bientôt.</p>'}

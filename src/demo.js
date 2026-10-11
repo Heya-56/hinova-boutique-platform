@@ -1,6 +1,7 @@
 // Boutiques de démonstration (fictives) affichées dans le carrousel d'accueil — une par modèle.
 // Aucune base de données : tout est ici, illustrations SVG originales à la place des photos.
 import { MODELES } from './plans.js';
+import { heroPhoto, productPhoto } from './photos.js';
 
 const S = (type, o) => ({ id: type + Math.random().toString(36).slice(2, 6), type, visible: true, ...o });
 const offre = (id, nom, prix_xpf, illu, description = '', stock = 5) => ({ id, nom, prix_xpf, illu, description, stock, image_url: null });
@@ -104,7 +105,7 @@ export function demoBoutique(modele) {
       couleur_principale: m.primary, couleur_secondaire: m.secondary, logo_url: null,
       whatsapp: '', telephone: '', infos_livraison: 'Expédition sous 48 h par la poste.',
     },
-    offres: d.offres,
-    sections: d.sections,
+    offres: d.offres.map((o, i) => ({ ...o, image_url: productPhoto(modele, i) })),
+    sections: d.sections.map((x) => (x.type === 'hero' ? { ...x, image: heroPhoto(modele) } : x)),
   };
 }

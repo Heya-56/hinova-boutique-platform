@@ -14,7 +14,8 @@ import { DEMOS, demoBoutique } from './demo.js';
 import { illu } from './art.js';
 import { EDITOR_JS, EDITOR_CSS } from './editor.js';
 import { landingPage } from './landing.js';
-import { generateShop, encodeGen, decodeGen } from './ai.js';
+import { generateShop, fallbackGen, encodeGen, decodeGen } from './ai.js';
+import { productPhoto } from './photos.js';
 
 const SESSION = 'hb_s';
 const OAUTH = 'hb_oauth';
@@ -98,12 +99,13 @@ const notFound = () => html(appPage({ title: 'Page introuvable', body: '<div cla
 
 // ───────────────────────────── Authentification Google ─────────────────────────────
 
-function needSecret(env) {
-  if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET manquant ou trop court (32 caractères minimum).');
-}
+// Sans SESSION_SECRET (ou Google non configuré), le site reste en ligne : seules les connexions sont fermées.
+const secretOk = (env) => !!env.SESSION_SECRET && env.SESSION_SECRET.length >= 32;
+const loginReady = (env) => secretOk(env) && (!!env.GOOGLE_CLIENT_ID || env.DEV_LOGIN === '1');
+const CLOSED = 'Les comptes commerçants ouvrent très bientôt. Laissez-nous votre contact pour être prévenu(e).';
 
 async function currentUser(request, env) {
-  needSecret(env);
+  if (!secretOk(env)) return null;
   const s = await verify(getCookie(request, SESSION), env.SESSION_SECRET);
   if (!s?.e) return null;
   const user = await env.DB.prepare('SELECT * FROM utilisateurs WHERE email_google = ?').bind(s.e).first();
@@ -111,7 +113,7 @@ async function currentUser(request, env) {
 }
 
 async function openSession(env, email, next) {
-  needSecret(env);
+  if (!secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
   const e = email.toLowerCase();
   const admins = String(env.ADMIN_EMAILS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
   if (admins.includes(e)) await env.DB.prepare(`INSERT OR IGNORE INTO utilisateurs (email_google, role) VALUES (?, 'admin')`).bind(e).run();
@@ -124,17 +126,21 @@ function loginPage(env, url) {
   const dev = env.DEV_LOGIN === '1' ? `<form method="get" action="/auth/dev" class="card" style="margin-top:16px;border-style:dashed">
       <p class="small muted">Mode développement (désactivé en production)</p><input type="hidden" name="next" value="${esc(next)}">
       <label for="de">E-mail de test</label><input id="de" name="email" type="email" required><button class="btn small" style="margin-top:10px">Connexion test</button></form>` : '';
-  const body = `<div style="max-width:440px;margin:30px auto">${flash(url)}<div class="card" style="text-align:center">
-    <h1>Connexion</h1><p class="muted">Un seul compte Google pour gérer votre boutique, sans mot de passe à retenir.</p>
-    <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a></div>${dev}</div>`;
+  const ready = loginReady(env) && !!env.GOOGLE_CLIENT_ID;
+  const main = ready
+    ? `<h1>Connexion</h1><p class="muted">Un seul compte Google pour gérer votre boutique, sans mot de passe à retenir.</p>
+    <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>`
+    : `<h1>Bientôt disponible</h1><p class="muted">${CLOSED}</p>
+    <a class="btn" href="mailto:${esc(env.SUPPORT_EMAIL)}?subject=${encodeURIComponent('Je veux ma boutique Hinova')}">Être prévenu(e)</a>
+    <p class="small"><a href="/">← Revenir au générateur</a></p>`;
+  const body = `<div style="max-width:440px;margin:30px auto">${ready ? flash(url) : ''}<div class="card" style="text-align:center">${main}</div>${secretOk(env) ? dev : ''}</div>`;
   return html(appPage({ title: 'Connexion', body }));
 }
 
 const GOOGLE_G = '<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.5l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.8 6C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.4 5.7c4.3-4 6.9-9.9 6.9-17z"/><path fill="#FBBC05" d="M10.5 28.7A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.7l-7.8-6A24 24 0 0 0 0 24c0 3.9.9 7.5 2.6 10.7l7.9-6z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.4-5.7c-2.1 1.4-4.8 2.3-8.5 2.3-6.3 0-11.6-4.2-13.5-9.9l-7.9 6C6.6 42.6 14.6 48 24 48z"/></svg>';
 
 async function googleStart(request, env, url) {
-  if (!env.GOOGLE_CLIENT_ID) return redirect(withMsg('/connexion', 'err', 'Connexion Google non configurée (GOOGLE_CLIENT_ID).'));
-  needSecret(env);
+  if (!env.GOOGLE_CLIENT_ID || !secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
   const state = uid();
   const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
   const cookie = await sign({ s: state, n: next, x: Date.now() + 600000 }, env.SESSION_SECRET);
@@ -146,7 +152,7 @@ async function googleStart(request, env, url) {
 }
 
 async function googleCallback(request, env, url) {
-  needSecret(env);
+  if (!secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
   const saved = await verify(getCookie(request, OAUTH), env.SESSION_SECRET);
   const fail = (m) => redirect(withMsg('/connexion', 'err', m), { 'set-cookie': setCookie(OAUTH, '', 0) });
   if (!saved || saved.s !== url.searchParams.get('state')) return fail('Session de connexion expirée, réessayez.');
@@ -189,9 +195,10 @@ async function onboardingForm(request, env, url, values = {}) {
   if (!who) {
     const next = `/demarrer?modele=${modeleSel}&plan=${plan}${gen ? '&g=' + gRaw : ''}`;
     const body = `<div style="max-width:480px;margin:30px auto" class="card"><h1>Créer ma boutique</h1>
-      <p>${gen ? `Votre boutique <b>${esc(gen.nom)}</b> est prête à être créée.` : `Modèle choisi : <b>${esc(getModele(modele).label)}</b>.`} Connectez-vous avec Google pour continuer : c’est votre compte de gestion.</p>
-      <a class="btn google" href="/connexion?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>
-      <p class="small muted"><a href="/">← Revoir les modèles</a></p></div>`;
+      <p>${gen ? `Votre boutique <b>${esc(gen.nom)}</b> est prête à être créée.` : `Modèle choisi : <b>${esc(getModele(modele).label)}</b>.`}${loginReady(env) ? ' Connectez-vous avec Google pour continuer : c’est votre compte de gestion.' : ''}</p>
+      ${loginReady(env) ? `<a class="btn google" href="/connexion?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>`
+        : `<p class="flash ok">${CLOSED}</p><a class="btn" href="mailto:${esc(env.SUPPORT_EMAIL)}?subject=${encodeURIComponent('Je veux ma boutique ' + (gen ? gen.nom : 'Hinova'))}">Être prévenu(e)</a>`}
+      <p class="small muted"><a href="/">← Revenir au générateur</a></p></div>`;
     return html(appPage({ title: 'Créer ma boutique', body }));
   }
   if (who.user?.role === 'admin') return redirect('/admin');
@@ -264,7 +271,8 @@ async function apiGenerate(request, env) {
   const description = clean(body.description, 400);
   const nom = clean(body.nom, 60);
   if (description.length < 8) return Response.json({ error: 'Décrivez votre activité en une phrase (8 caractères minimum).' }, { status: 400 });
-  const gen = await generateShop(env, description, nom);
+  // « rapide » : proposition instantanée ; sinon : rédaction par l'IA (avec secours automatique).
+  const gen = body.mode === 'rapide' ? fallbackGen(description, nom) : await generateShop(env, description, nom);
   const g = encodeGen(gen);
   return Response.json({
     source: gen.source, nom: gen.nom, slogan: gen.slogan, modele: gen.modele, modeleLabel: getModele(gen.modele).label,
@@ -279,7 +287,9 @@ function previewStore(url) {
   if (!gen) return notFound();
   const b = { id: 'apercu', nom: gen.nom, slogan: gen.slogan, modele: gen.modele, statut: 'active', couleur_principale: gen.couleur_principale,
     couleur_secondaire: gen.couleur_secondaire, logo_url: null, whatsapp: '', telephone: '', infos_livraison: 'Expédition par la poste dans toutes les îles.' };
-  return html(renderStore(b, gen.offres, gen.sections, { base: '', demo: true }), 200, {
+  // Aperçu : photos d'exemple sur les produits ; la vraie boutique démarre sans, le commerçant met les siennes.
+  const offres = gen.offres.map((o, i) => ({ ...o, image_url: productPhoto(gen.modele, i) }));
+  return html(renderStore(b, offres, gen.sections, { base: '', demo: true }), 200, {
     'x-frame-options': 'SAMEORIGIN', 'content-security-policy': "frame-ancestors 'self'", 'cache-control': 'no-store', 'x-robots-tag': 'noindex',
   });
 }
@@ -464,6 +474,10 @@ function appearanceForm(env, url, b) {
       <label for="logo">Logo (PNG, JPG ou WebP, 2 Mo max)</label>
       ${b.logo_url ? `<img src="${esc(b.logo_url)}" alt="Logo actuel" style="height:56px;width:auto;margin:6px 0"><label style="font-weight:400"><input type="checkbox" name="retirer_logo"> Retirer le logo</label>` : ''}
       <input id="logo" name="logo" type="file" accept="image/png,image/jpeg,image/webp">
+      <label for="banniere">Photo de bannière (en haut de la page)</label>
+      ${(() => { const h = sections.find((x) => x.type === 'hero' && x.image); return h ? `<img src="${esc(h.image)}" alt="Bannière actuelle" style="height:90px;width:auto;border-radius:10px;margin:6px 0"><label style="font-weight:400"><input type="checkbox" name="retirer_banniere"> Retirer la photo (l’illustration revient)</label>` : ''; })()}
+      <input id="banniere" name="banniere" type="file" accept="image/png,image/jpeg,image/webp">
+      <p class="small muted">Mettez vos propres photos : produits dans « Produits », ambiance ici.</p>
     </div>
     <div class="card"><h2>Sections de la vitrine</h2>
       <p class="muted small">Ordonnez, masquez et modifiez les blocs de votre page. La section « Produits et commande » est obligatoire.</p>
@@ -488,6 +502,11 @@ async function appearancePost(request, env, b) {
   const up = await storeImage(env, b.id, f.get('logo'));
   if (up.error) return redirect(withMsg('/tableau-de-bord/apparence', 'err', up.error));
   if (up.url || f.get('retirer_logo')) { await dropImage(env, b.logo_url); logo = up.url || null; }
+  const ban = await storeImage(env, b.id, f.get('banniere'));
+  if (ban.error) return redirect(withMsg('/tableau-de-bord/apparence', 'err', ban.error));
+  if (ban.url || f.get('retirer_banniere')) {
+    for (const h of sections.filter((x) => x.type === 'hero')) { await dropImage(env, h.image); h.image = ban.url || ''; }
+  }
   await env.DB.prepare('UPDATE boutiques SET modele=?, couleur_principale=?, couleur_secondaire=?, logo_url=?, sections_json=? WHERE id=?')
     .bind(modele, cp, cs, logo, JSON.stringify(sections), b.id).run();
   return redirect(withMsg('/tableau-de-bord/apparence', 'ok', 'Apparence enregistrée.'));

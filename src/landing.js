@@ -48,6 +48,9 @@ background:linear-gradient(90deg,var(--cyan),#7FF0DD 45%,var(--gold));box-shadow
 .facts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.facts span{font:.78rem/1 var(--mono);border:1px solid var(--line);border-radius:8px;padding:7px 9px;color:var(--ink);display:inline-flex;gap:6px;align-items:center}
 .facts i{width:12px;height:12px;border-radius:3px;display:inline-block}
 .acts{display:flex;gap:10px;flex-wrap:wrap}
+.ai-wait{display:flex;align-items:center;gap:8px;color:var(--cyan)!important;font:.82rem/1.4 var(--mono)!important;margin:0 0 12px!important}
+.ai-wait[hidden]{display:none}.ai-wait .spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(63,224,197,.3);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite}
+.note{font-size:.78rem!important;margin:0 0 12px!important}
 .btn{display:inline-flex;justify-content:center;align-items:center;gap:8px;border-radius:12px;padding:13px 18px;font:700 .98rem/1 var(--head);text-decoration:none;border:0;cursor:pointer}
 .btn.gold{background:var(--gold);color:#1B1305;flex:1}.btn.line{background:transparent;color:var(--ink);border:1px solid var(--line)}
 .stage{position:relative;display:flex;justify-content:center}
@@ -113,36 +116,43 @@ const JS = `(function(){
   [].forEach.call(d.querySelectorAll('.chip'),function(c){ c.addEventListener('click',function(){ desc.value=c.textContent; desc.focus(); }); });
   function line(txt,cls){ var p=d.createElement('div'); if(cls) p.className=cls; p.textContent=txt; term.appendChild(p); return p; }
   function wait(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
-  var running=false;
+  var running=false, run=0;
+  function post(mode,v){ return fetch('/api/generer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({description:v,nom:nom.value.trim(),mode:mode})})
+    .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error||'Erreur'); return j; }); }); }
+  function show(j,label){
+    frame.style.opacity=0;
+    frame.onload=function(){ fit(); frame.style.opacity=1; scan.classList.remove('on'); };
+    frame.src=j.apercu; open.href=j.apercu; tag.textContent='aperçu de votre boutique';
+    d.getElementById('r-src').textContent=label;
+    d.getElementById('r-nom').textContent=j.nom; d.getElementById('r-slogan').textContent=j.slogan;
+    d.getElementById('r-modele').textContent='modèle '+j.modeleLabel;
+    d.getElementById('r-prod').textContent=j.produits+' produits';
+    d.getElementById('r-c1').style.background=j.couleurs[0]; d.getElementById('r-c2').style.background=j.couleurs[1];
+    d.getElementById('r-create').href=j.creer; res.classList.add('on');
+  }
+  function done(){ running=false; go.disabled=false; go.classList.remove('busy'); go.querySelector('span').textContent='Régénérer ✦'; }
   form.addEventListener('submit',function(e){ e.preventDefault(); if(running) return;
     var v=desc.value.trim(); err.textContent='';
     if(v.length<8){ err.textContent='Décrivez votre activité en une phrase.'; desc.focus(); return; }
-    running=true; go.disabled=true; go.classList.add('busy'); go.querySelector('span').textContent='Génération en cours…';
+    var me=++run; running=true; go.disabled=true; go.classList.add('busy'); go.querySelector('span').textContent='Génération…';
     res.classList.remove('on'); term.textContent=''; term.classList.add('on'); scan.classList.add('on'); tag.textContent='génération…';
-    if(window.innerWidth<860) d.getElementById('preview').scrollIntoView({behavior:'smooth',block:'center'});
-    var steps=['analyse de votre activité','choix du modèle et des couleurs','rédaction des textes','création du catalogue'];
-    var req=fetch('/api/generer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({description:v,nom:nom.value.trim()})})
-      .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error||'Erreur'); return j; }); });
+    var refine=d.getElementById('r-ai'); refine.hidden=true;
+    var ia=post('ia',v);
     (async function(){
-      var cur;
-      for(var i=0;i<steps.length;i++){ if(cur) cur.className=''; cur=line('> '+steps[i]+'…','cur'); await wait(650); }
       try{
-        var j=await req; cur.className='';
-        line('✓ modèle '+j.modeleLabel,'ok'); await wait(200);
-        line('✓ '+j.produits+' produits, '+j.sections+' sections','ok'); await wait(200);
-        line('✓ boutique prête','ok');
-        frame.style.opacity=0;
-        frame.onload=function(){ fit(); frame.style.opacity=1; scan.classList.remove('on'); };
-        frame.src=j.apercu; open.href=j.apercu; tag.textContent='aperçu de votre boutique';
-        d.getElementById('r-src').textContent= j.source==='ia' ? '✦ Généré par IA' : '✦ Proposition automatique';
-        d.getElementById('r-nom').textContent=j.nom; d.getElementById('r-slogan').textContent=j.slogan;
-        d.getElementById('r-modele').textContent='modèle '+j.modeleLabel;
-        d.getElementById('r-prod').textContent=j.produits+' produits';
-        d.getElementById('r-c1').style.background=j.couleurs[0]; d.getElementById('r-c2').style.background=j.couleurs[1];
-        d.getElementById('r-create').href=j.creer;
-        res.classList.add('on');
-      }catch(x){ err.textContent=x.message||'La génération a échoué, réessayez.'; scan.classList.remove('on'); tag.textContent='exemple'; }
-      running=false; go.disabled=false; go.classList.remove('busy'); go.querySelector('span').textContent='Régénérer ✦';
+        line('> analyse de votre activité…'); var j=await post('rapide',v); await wait(250);
+        line('✓ modèle '+j.modeleLabel+', couleurs et sections','ok'); await wait(200);
+        line('✓ première version prête','ok');
+        show(j,'✦ Première version'); refine.hidden=false;
+        if(window.innerWidth<860) d.getElementById('preview').scrollIntoView({behavior:'smooth',block:'center'});
+        done();
+        var cur=line('> l’IA rédige vos textes et votre catalogue…','cur');
+        try{ var k=await ia; if(me!==run) return; cur.className='';
+          if(k.source==='ia'){ line('✓ boutique affinée par l’IA','ok'); scan.classList.add('on'); show(k,'✦ Affinée par IA'); }
+          else { line('· version automatique conservée'); d.getElementById('r-src').textContent='✦ Proposition automatique'; }
+        }catch(x){ if(me===run){ cur.className=''; line('· version automatique conservée'); } }
+        if(me===run) refine.hidden=true;
+      }catch(x){ err.textContent=x.message||'La génération a échoué, réessayez.'; scan.classList.remove('on'); tag.textContent='exemple'; done(); }
     })();
   });
   d.getElementById('r-again').addEventListener('click',function(){ form.requestSubmit ? form.requestSubmit() : go.click(); });
@@ -206,6 +216,8 @@ export function landingPage(env) {
         <div class="result" id="result" aria-live="polite">
           <span class="src" id="r-src"></span><h3 id="r-nom"></h3><p id="r-slogan"></p>
           <div class="facts"><span id="r-modele"></span><span id="r-prod"></span><span><i id="r-c1"></i><i id="r-c2"></i>couleurs</span></div>
+          <p class="ai-wait" id="r-ai" hidden><i class="spin"></i> L’IA affine votre boutique, l’aperçu se met à jour tout seul…</p>
+          <p class="note">Photos d’exemple : dans votre boutique, vous mettrez les vôtres.</p>
           <div class="acts"><a class="btn gold" id="r-create" href="/demarrer">Créer cette boutique</a><button class="btn line" id="r-again" type="button">Régénérer</button></div>
         </div>
       </form>

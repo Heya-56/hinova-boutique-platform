@@ -51,7 +51,7 @@ export const EDITOR_JS = String.raw`(function () {
         def.required ? null : el('button', { type: 'button', class: 'btn small danger', text: 'Retirer', onclick: function () { if (confirm('Retirer cette section ?')) { state.splice(i, 1); render(); } } })
       ])
     ]);
-    var body = el('div', { class: 'ed-body' }, def.fields.map(function (f) { return field(f, s); }));
+    var body = el('div', { class: 'ed-body' }, def.fields.filter(function (f) { return !f.hidden; }).map(function (f) { return field(f, s); }));
     if (def.items) {
       s.items = s.items || [];
       s.items.forEach(function (it, k) {

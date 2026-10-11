@@ -5,9 +5,10 @@ import { MODELES, getModele } from './plans.js';
 import { ILLUS } from './art.js';
 import { sanitizeSections } from './sections.js';
 import { DEMOS } from './demo.js';
+import { heroPhoto } from './photos.js';
 
 const MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-const AI_TIMEOUT_MS = 15000;
+const AI_TIMEOUT_MS = 25000;
 
 const SCHEMA = {
   type: 'object',
@@ -82,7 +83,7 @@ function toGen(raw, source) {
   const faq = (raw.faq || []).slice(0, 6).map((x) => ({ q: clean(x?.q, 140), r: clean(x?.r, 500) })).filter((x) => x.q && x.r);
   const sections = [
     raw.annonce ? { id: sid(), type: 'annonce', visible: true, texte: clean(raw.annonce, 120) } : null,
-    { id: sid(), type: 'hero', visible: true, titre: clean(raw.hero_titre, 80) || clean(raw.nom, 80), texte: clean(raw.hero_texte, 240), bouton: 'Découvrir', motif: ILLUS.includes(raw.motif) ? raw.motif : 'vague' },
+    { id: sid(), type: 'hero', visible: true, titre: clean(raw.hero_titre, 80) || clean(raw.nom, 80), texte: clean(raw.hero_texte, 240), bouton: 'Découvrir', motif: ILLUS.includes(raw.motif) ? raw.motif : 'vague', image: heroPhoto(MODELES[raw.modele] ? raw.modele : 'lagon') },
     { id: sid(), type: 'produits', visible: true, titre: 'La collection' },
     pf.length ? { id: sid(), type: 'avantages', visible: true, titre: 'Pourquoi nous choisir', items: pf } : null,
     raw.histoire ? { id: sid(), type: 'texte', visible: true, titre: 'Notre histoire', texte: clean(raw.histoire, 1200) } : null,
@@ -132,7 +133,7 @@ export async function generateShop(env, description, nom) {
       const user = `Description du commerçant : ${description}${nom ? `\nNom de la boutique : ${nom}` : ''}`;
       const run = env.AI.run(MODEL, {
         messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
-        response_format: { type: 'json_schema', json_schema: SCHEMA }, max_tokens: 1400, temperature: 0.6,
+        response_format: { type: 'json_schema', json_schema: SCHEMA }, max_tokens: 1000, temperature: 0.6,
       });
       const res = await Promise.race([run, new Promise((_, rej) => setTimeout(() => rej(new Error('IA trop lente')), AI_TIMEOUT_MS))]);
       let out = res?.response ?? res;
