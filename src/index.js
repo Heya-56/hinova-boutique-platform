@@ -14,6 +14,7 @@ import { DEMOS, demoBoutique } from './demo.js';
 import { illu } from './art.js';
 import { EDITOR_JS, EDITOR_CSS } from './editor.js';
 import { landingPage } from './landing.js';
+import { generateShop, encodeGen, decodeGen } from './ai.js';
 
 const SESSION = 'hb_s';
 const OAUTH = 'hb_oauth';
@@ -57,6 +58,8 @@ async function route(request, env) {
   if (p === '/static/editeur.js') return new Response(EDITOR_JS, { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=3600' } });
   if (parts[0] === 'img') return serveImage(url, env);
   if (parts[0] === 'demo' && parts[1]) return demoStore(parts[1]);
+  if (p === '/api/generer' && method === 'POST') return apiGenerate(request, env);
+  if (p === '/apercu') return previewStore(url);
   if (parts[0] === 'b' && parts[1]) {
     const sub = '/' + parts.slice(2).join('/');
     return storefront(request, env, url, parts[1], sub, `/b/${encodeURIComponent(parts[1])}`);
@@ -179,10 +182,14 @@ async function onboardingForm(request, env, url, values = {}) {
   const who = await currentUser(request, env);
   const modele = MODELES[values.modele || url.searchParams.get('modele')] ? (values.modele || url.searchParams.get('modele')) : 'lagon';
   const plan = PLANS[values.plan || url.searchParams.get('plan')] ? (values.plan || url.searchParams.get('plan')) : 'plan_1';
+  const gRaw = values.g || url.searchParams.get('g') || '';
+  const gen = decodeGen(gRaw);
+  if (gen && !values.nom) { values.nom = gen.nom; values.modele = gen.modele; }
+  const modeleSel = gen ? gen.modele : modele;
   if (!who) {
-    const next = `/demarrer?modele=${modele}&plan=${plan}`;
+    const next = `/demarrer?modele=${modeleSel}&plan=${plan}${gen ? '&g=' + gRaw : ''}`;
     const body = `<div style="max-width:480px;margin:30px auto" class="card"><h1>Créer ma boutique</h1>
-      <p>Modèle choisi : <b>${esc(getModele(modele).label)}</b>. Connectez-vous avec Google pour continuer : c’est votre compte de gestion.</p>
+      <p>${gen ? `Votre boutique <b>${esc(gen.nom)}</b> est prête à être créée.` : `Modèle choisi : <b>${esc(getModele(modele).label)}</b>.`} Connectez-vous avec Google pour continuer : c’est votre compte de gestion.</p>
       <a class="btn google" href="/connexion?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>
       <p class="small muted"><a href="/">← Revoir les modèles</a></p></div>`;
     return html(appPage({ title: 'Créer ma boutique', body }));
@@ -193,12 +200,14 @@ async function onboardingForm(request, env, url, values = {}) {
   const body = `<div class="card" style="max-width:640px;margin:0 auto">
     <h1>Créer ma boutique</h1>${flash(url)}
     <p class="muted small">Connecté avec ${esc(who.email)} · <a href="/deconnexion">changer de compte</a></p>
+    ${gen ? `<p class="flash ok">Votre boutique générée (${gen.offres.length} produits, textes et sections) sera reprise telle quelle : vous pourrez tout modifier ensuite.</p>` : ''}
     <form method="post">
+      ${gen ? `<input type="hidden" name="g" value="${esc(gRaw)}">` : ''}
       <label for="nom">Nom de la boutique</label><input id="nom" name="nom" required maxlength="60" value="${esc(values.nom)}">
       <label for="sd">Adresse de la boutique</label><input id="sd" name="sous_domaine" maxlength="40" placeholder="ex. te-mira" value="${esc(values.sous_domaine)}">
       <p class="small muted">Votre boutique sera à l’adresse <b>${env.ROOT_DOMAIN ? 'nom' + suffix : '/b/nom'}</b>. Lettres, chiffres et tirets ; laissez vide pour la créer depuis le nom.</p>
       <label>Modèle</label>
-      <div class="modeles">${Object.entries(MODELES).map(([k, m]) => `<label><input type="radio" name="modele" value="${k}" ${k === modele ? 'checked' : ''}> ${m.label}
+      <div class="modeles">${Object.entries(MODELES).map(([k, m]) => `<label><input type="radio" name="modele" value="${k}" ${k === modeleSel ? 'checked' : ''}> ${m.label}
         <div class="swatch"><i style="background:${m.tokens.bg}"></i><i style="background:${m.primary}"></i><i style="background:${m.secondary}"></i></div></label>`).join('')}</div>
       <div class="row">
         <div><label for="plan">Formule</label><select id="plan" name="plan">${Object.values(PLANS).map((pl) => `<option value="${pl.key}" ${pl.key === plan ? 'selected' : ''}>${esc(pl.label)} — ${fmtXpf(pl.monthly)}/mois · ${pl.maxProducts} produits</option>`).join('')}</select></div>
@@ -218,8 +227,9 @@ async function onboardingPost(request, env, url) {
   const values = {
     nom: clean(f.get('nom'), 60), sous_domaine: slugify(f.get('sous_domaine') || f.get('nom')),
     modele: MODELES[f.get('modele')] ? f.get('modele') : 'lagon', plan: PLANS[f.get('plan')] ? f.get('plan') : 'plan_1',
-    cycle: f.get('cycle') === 'annuel' ? 'annuel' : 'mensuel',
+    cycle: f.get('cycle') === 'annuel' ? 'annuel' : 'mensuel', g: String(f.get('g') || ''),
   };
+  const gen = decodeGen(values.g);
   const fail = (m) => { const u = new URL(url); u.searchParams.set('err', m); return onboardingForm(request, env, u, values); };
   if (!values.nom) return fail('Indiquez le nom de la boutique.');
   if (values.sous_domaine.length < 3 || RESERVED.has(values.sous_domaine)) return fail('Cette adresse n’est pas disponible (3 caractères minimum).');
@@ -230,13 +240,48 @@ async function onboardingPost(request, env, url) {
   const m = getModele(values.modele);
   const id = uid();
   const echeance = addDays(nowIso(), int(env.TRIAL_DAYS, 14));
+  const sameModele = gen && gen.modele === values.modele;
+  const cp = sameModele ? gen.couleur_principale : m.primary;
+  const cs = sameModele ? gen.couleur_secondaire : m.secondary;
+  const sections = gen ? gen.sections : defaultSections({ nom: values.nom });
+  const offres = gen ? gen.offres.slice(0, getPlan(values.plan).maxProducts) : [];
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json)
-      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`)
-      .bind(id, values.nom, domaine, values.modele, echeance, values.plan, values.cycle, m.primary, m.secondary, JSON.stringify(defaultSections({ nom: values.nom }))),
+    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json, slogan)
+      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, values.nom, domaine, values.modele, echeance, values.plan, values.cycle, cp, cs, JSON.stringify(sections), gen ? gen.slogan : null),
     env.DB.prepare(`INSERT INTO utilisateurs (email_google, boutique_id, role) VALUES (?, ?, 'client')`).bind(who.email, id),
+    ...offres.map((o, i) => env.DB.prepare('INSERT INTO offres (id, boutique_id, nom, description, prix_xpf, stock, ordre) VALUES (?, ?, ?, ?, ?, 1, ?)')
+      .bind(uid(), id, o.nom, o.description, o.prix_xpf, i + 1)),
   ]);
   return redirect(withMsg('/tableau-de-bord', 'ok', 'Bienvenue ! Votre boutique est créée. Suivez les étapes ci-dessous pour l’ouvrir.'));
+}
+
+// ───────────────────────────── Générateur IA ─────────────────────────────
+
+async function apiGenerate(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch { /* corps invalide */ }
+  const description = clean(body.description, 400);
+  const nom = clean(body.nom, 60);
+  if (description.length < 8) return Response.json({ error: 'Décrivez votre activité en une phrase (8 caractères minimum).' }, { status: 400 });
+  const gen = await generateShop(env, description, nom);
+  const g = encodeGen(gen);
+  return Response.json({
+    source: gen.source, nom: gen.nom, slogan: gen.slogan, modele: gen.modele, modeleLabel: getModele(gen.modele).label,
+    produits: gen.offres.length, sections: gen.sections.filter((x) => x.visible).length,
+    couleurs: [gen.couleur_principale, gen.couleur_secondaire],
+    apercu: `/apercu?g=${g}`, creer: `/demarrer?g=${g}`,
+  }, { headers: { 'cache-control': 'no-store' } });
+}
+
+function previewStore(url) {
+  const gen = decodeGen(url.searchParams.get('g'));
+  if (!gen) return notFound();
+  const b = { id: 'apercu', nom: gen.nom, slogan: gen.slogan, modele: gen.modele, statut: 'active', couleur_principale: gen.couleur_principale,
+    couleur_secondaire: gen.couleur_secondaire, logo_url: null, whatsapp: '', telephone: '', infos_livraison: 'Expédition par la poste dans toutes les îles.' };
+  return html(renderStore(b, gen.offres, gen.sections, { base: '', demo: true }), 200, {
+    'x-frame-options': 'SAMEORIGIN', 'content-security-policy': "frame-ancestors 'self'", 'cache-control': 'no-store', 'x-robots-tag': 'noindex',
+  });
 }
 
 // ───────────────────────────── Règles métier ─────────────────────────────
@@ -666,7 +711,7 @@ function renderStore(b, offres, sections, { base, demo = false, flashHtml = '' }
   const ctx = { b, offres, base, demo, methods, canOrder: methods.length > 0 && offres.some((o) => o.stock > 0), ...c };
   const annonce = renderSections(sections.filter((s) => s.type === 'annonce'), ctx);
   const body = (flashHtml ? `<div class="wrap">${flashHtml}</div>` : '') + renderSections(sections.filter((s) => s.type !== 'annonce'), ctx);
-  return storePage(b, { title: b.nom, body, base, annonce, description: b.slogan || `Boutique ${b.nom}` });
+  return storePage(b, { title: b.nom, body, base, annonce, description: b.slogan || `Boutique ${b.nom}`, cart: ctx.canOrder });
 }
 
 function demoStore(modele) {
@@ -757,7 +802,7 @@ async function orderConfirmation(env, b, id, base) {
     <h2>Paiement</h2>${pay}
     <p class="muted">${esc(b.nom)} prépare votre commande dès réception du paiement ; votre facture vous sera envoyée.</p>
     <div class="row-btn">${wa}<a class="btn btn-ghost" href="${esc(base || '/')}">Retour à la boutique</a></div></div></section>`;
-  return html(storePage(b, { title: `Commande ${ref}`, body, base }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
+  return html(storePage(b, { title: `Commande ${ref}`, body, base, clearCart: true }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
 }
 
 async function invoicePage(env, id) {

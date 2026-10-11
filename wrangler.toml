@@ -31,3 +31,27 @@ migrations_dir = "migrations"
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "hinova-boutiques-images"
+
+# Workers AI : rédaction des boutiques par le générateur (secours automatique si indisponible)
+[ai]
+binding = "AI"
+
+# Environnement de test local (sans Workers AI, qui exige une connexion au compte) : npx wrangler dev --env test
+[env.test]
+[env.test.vars]
+BRAND = "Hinova Boutiques"
+SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
+ROOT_DOMAIN = ""
+TRIAL_DAYS = "14"
+GRACE_DAYS = "3"
+ADMIN_EMAILS = "admin@test.pf"
+
+[[env.test.d1_databases]]
+binding = "DB"
+database_name = "hinova_boutiques"
+database_id = "669366c5-aa8f-42c9-a8b7-d851928ec122"
+migrations_dir = "migrations"
+
+[[env.test.r2_buckets]]
+binding = "IMAGES"
+bucket_name = "hinova-boutiques-images"

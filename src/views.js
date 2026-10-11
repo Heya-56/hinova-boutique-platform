@@ -173,20 +173,97 @@ pre.pay{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);p
 @media print{header.shop,footer.shop,.noprint{display:none!important}}`;
 }
 
-export function storePage(b, { title, body, base = '', annonce = '', description = '' }) {
+const CART_CSS = `
+.add{display:none;margin-top:8px;width:100%;background:var(--p);color:var(--on-p);border:0;border-radius:var(--br);padding:10px 12px;font:600 .9rem/1.1 Inter,system-ui,sans-serif;cursor:pointer}
+.add:active{transform:scale(.97)}
+.js .qty{display:none}.js .add{display:block}.js .no-js-only{display:none}
+.cart-btn{display:none;align-items:center;gap:8px;font:600 .9rem/1 Inter,system-ui,sans-serif;background:var(--p);color:var(--on-p);border:0;border-radius:var(--br);padding:9px 14px;cursor:pointer}
+.js .cart-btn{display:inline-flex}
+.cart-btn b{background:var(--on-p);color:var(--p);border-radius:99px;min-width:22px;height:22px;display:inline-grid;place-items:center;font-size:.78rem;padding:0 6px}
+.cart-btn.bump{animation:bump .35s}@keyframes bump{50%{transform:scale(1.12)}}
+.drawer[hidden]{display:none}
+.drawer{position:fixed;inset:0;z-index:50}
+.drawer-bg{position:absolute;inset:0;background:rgba(0,0,0,.45);animation:fade .2s}
+.drawer-panel{position:absolute;top:0;right:0;bottom:0;width:min(440px,100%);background:var(--bg);color:var(--ink);display:flex;flex-direction:column;box-shadow:-20px 0 50px rgba(0,0,0,.25);animation:slide .25s ease-out}
+@keyframes slide{from{transform:translateX(100%)}}@keyframes fade{from{opacity:0}}
+.drawer-head{display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line)}
+.drawer-head h2{margin:0;font-size:1.3rem}
+.x{background:none;border:0;font-size:1.8rem;line-height:1;color:var(--ink);cursor:pointer;padding:4px 8px}
+.drawer-body{overflow-y:auto;padding:6px 18px 24px;flex:1}
+.line{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.line .n{font-weight:600}.line .p{color:var(--muted);font-size:.88rem}
+.stepper{display:flex;align-items:center;gap:6px;grid-row:span 2;align-self:center}
+.stepper button{width:32px;height:32px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:1.1rem;cursor:pointer}
+.stepper span{min-width:22px;text-align:center;font-weight:600}
+.cart-total{display:flex;justify-content:space-between;font-size:1.1rem;padding:14px 0 4px}
+.empty{color:var(--muted);padding:26px 0;text-align:center}
+.drawer .order{margin-top:10px;border:0;padding:0;background:none}
+@media (prefers-reduced-motion:reduce){.drawer-panel,.drawer-bg,.cart-btn.bump{animation:none}}
+`;
+
+const CART_JS = `(function(){
+  var d=document, root=d.documentElement; root.classList.add('js');
+  var drawer=d.getElementById('panier'); if(!drawer) return;
+  var key='panier:'+(d.body.getAttribute('data-cart')||location.pathname);
+  var inputs=[].slice.call(d.querySelectorAll('input[form="commande"][name^="q_"]'));
+  var byName={}; inputs.forEach(function(i){ byName[i.name]=i; });
+  var lines=d.getElementById('cart-lines'), total=d.getElementById('cart-total'), count=d.getElementById('cart-count');
+  var order=d.querySelector('.order'), slot=d.getElementById('cart-checkout'), btn=d.getElementById('cart-open'), last=null;
+  if(order&&slot) slot.appendChild(order);
+  try{ var saved=JSON.parse(localStorage.getItem(key)||'{}'); Object.keys(saved).forEach(function(k){ if(byName[k]) byName[k].value=Math.min(+saved[k]||0,+byName[k].max||999); }); }catch(e){}
+  function fmt(n){ return new Intl.NumberFormat('fr-FR').format(n).replace(/[\\s\\u202f]/g,'\\u00a0')+'\\u00a0XPF'; }
+  function save(){ var o={}; inputs.forEach(function(i){ if(+i.value>0) o[i.name]=+i.value; }); try{ localStorage.setItem(key,JSON.stringify(o)); }catch(e){} }
+  function el(t,c,txt){ var n=d.createElement(t); if(c) n.className=c; if(txt!=null) n.textContent=txt; return n; }
+  function set(i,v){ i.value=Math.max(0,Math.min(v,+i.max||999)); save(); render(); }
+  function render(){
+    var n=0,t=0; lines.textContent='';
+    inputs.forEach(function(i){ var q=+i.value||0; if(!q) return; n+=q; t+=q*(+i.getAttribute('data-prix'));
+      var row=el('div','line'); row.appendChild(el('div','n',i.getAttribute('data-nom')));
+      var st=el('div','stepper'); var m=el('button',null,'−'); m.type='button'; m.setAttribute('aria-label','Retirer un'); m.onclick=function(){ set(i,q-1); };
+      var p=el('button',null,'+'); p.type='button'; p.setAttribute('aria-label','Ajouter un'); p.onclick=function(){ set(i,q+1); }; if(q>=(+i.max||999)) p.disabled=true;
+      st.appendChild(m); st.appendChild(el('span',null,q)); st.appendChild(p); row.appendChild(st);
+      row.appendChild(el('div','p',q+' × '+fmt(+i.getAttribute('data-prix')))); lines.appendChild(row); });
+    if(!n) lines.appendChild(el('p','empty','Votre panier est vide.'));
+    total.textContent=fmt(t); count.textContent=n; slot.hidden=!n; d.getElementById('cart-sum').hidden=!n;
+  }
+  function open(){ last=d.activeElement; drawer.hidden=false; d.body.style.overflow='hidden'; drawer.querySelector('.x').focus(); }
+  function close(){ drawer.hidden=true; d.body.style.overflow=''; if(last&&last.focus) last.focus(); }
+  [].forEach.call(d.querySelectorAll('[data-add]'),function(b){ b.addEventListener('click',function(){ var i=byName[b.getAttribute('data-add')]; if(!i) return;
+    if(+i.value>=(+i.max||999)){ b.textContent='Stock maximum atteint'; return; } set(i,(+i.value||0)+1);
+    btn.classList.remove('bump'); void btn.offsetWidth; btn.classList.add('bump'); open(); }); });
+  btn.addEventListener('click',open);
+  [].forEach.call(drawer.querySelectorAll('[data-close]'),function(x){ x.addEventListener('click',close); });
+  d.addEventListener('keydown',function(e){ if(e.key==='Escape'&&!drawer.hidden) close(); });
+  render();
+})();`;
+
+export function storePage(b, { title, body, base = '', annonce = '', description = '', cart = false, clearCart = false }) {
   const c = storeColors(b);
   const logo = b.logo_url ? `<img src="${esc(b.logo_url)}" alt="">` : '';
   const ctaHref = b.whatsapp ? `https://wa.me/${esc(b.whatsapp)}` : `${esc(base)}/#produits`;
+  const cartKey = base || 'site';
+  const drawer = cart ? `<div class="drawer" id="panier" role="dialog" aria-modal="true" aria-labelledby="panier-t" hidden>
+  <div class="drawer-bg" data-close></div>
+  <aside class="drawer-panel">
+    <div class="drawer-head"><h2 id="panier-t">Mon panier</h2><button class="x" type="button" data-close aria-label="Fermer le panier">×</button></div>
+    <div class="drawer-body"><div id="cart-lines"></div>
+      <div class="cart-total" id="cart-sum"><span>Total</span><b id="cart-total"></b></div>
+      <div id="cart-checkout"></div></div>
+  </aside></div>` : '';
   return `<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>${description ? `<meta name="description" content="${esc(description)}">` : ''}
 <meta name="theme-color" content="${esc(c.primary)}">
 ${FONT_LINK(c.m.fonts)}
-<style>${storeCss(c)}</style></head><body>
+<style>${storeCss(c)}${CART_CSS}</style></head><body data-cart="${esc(cartKey)}">
 ${annonce}
 <header class="shop"><div class="wrap"><a class="logo" href="${esc(base || '/')}">${logo}<span>${esc(b.nom)}</span></a>
-<a class="head-cta" href="${ctaHref}"${b.whatsapp ? ' target="_blank" rel="noopener"' : ''}>${b.whatsapp ? 'WhatsApp' : 'Collection'}</a></div></header>
+${cart ? '<button class="cart-btn" id="cart-open" type="button" aria-controls="panier">Panier <b id="cart-count">0</b></button>'
+  : `<a class="head-cta" href="${ctaHref}"${b.whatsapp ? ' target="_blank" rel="noopener"' : ''}>${b.whatsapp ? 'WhatsApp' : 'Collection'}</a>`}</div></header>
 <main>${body}</main>
 <footer class="shop"><div class="wrap">© ${esc(b.nom)}${b.ile ? ' · ' + esc(b.ile) : ''} · Boutique propulsée par Hinova Digital</div></footer>
+${drawer}
+${cart ? `<script>${CART_JS}</script>` : ''}
+${clearCart ? `<script>try{localStorage.removeItem('panier:'+${JSON.stringify(cartKey)})}catch(e){}</script>` : ''}
 </body></html>`;
 }

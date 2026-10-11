@@ -5,8 +5,8 @@
   "description": "Générateur de boutiques en ligne multi-commerçants pour la Polynésie française — Cloudflare Workers + D1 + R2",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "db:local": "wrangler d1 migrations apply hinova_boutiques --local",
+    "dev": "wrangler dev --env test",
+    "db:local": "wrangler d1 migrations apply hinova_boutiques --local --env test",
     "db:remote": "wrangler d1 migrations apply hinova_boutiques --remote",
     "test": "bash test/smoke.sh",
     "deploy": "wrangler deploy"

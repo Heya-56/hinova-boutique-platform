@@ -15,7 +15,7 @@ login(){ curl -s -o /dev/null -c "$1" "$BASE/auth/dev?email=$2&next=${3:-/tablea
 echo "1. Accueil et démonstrations"
 LAND=$(curl -s "$BASE/")
 check "accueil : carrousel de 4 boutiques" '[ "$(echo "$LAND" | grep -o "class=\"slide" | wc -l)" = 4 ]'
-check "chaque diapositive charge sa démo" '[ "$(echo "$LAND" | grep -o "src=\"/demo/" | wc -l)" = 4 ]'
+check "chaque diapositive charge sa démo" '[ "$(echo "$LAND" | grep -o "src=\"/demo/" | wc -l)" -ge 4 ]'
 for m in lagon pae tiare nuit; do check "démo $m en ligne et encadrable par le site" '[ "$(curl -s -D - -o /dev/null $BASE/demo/'$m' | grep -ci "x-frame-options: SAMEORIGIN")" = 1 ]'; done
 check "démo : formulaire de commande désactivé" 'curl -s $BASE/demo/lagon | grep -q "Boutique de démonstration"'
 check "pages internes non encadrables" 'curl -s -D - -o /dev/null $BASE/connexion | grep -qi "x-frame-options: DENY"'
@@ -113,7 +113,25 @@ curl -s -o /dev/null -b "$JA" "${H[@]}" -X POST "$BASE/admin/b/$BID/paiement" -d
 check "encaissement 12 mois → vitrine en ligne" '[ "$(code $BASE/b/$SLUG)" = 200 ]'
 check "cycle passé en annuel" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "annuel"'
 
-echo "9. Session"
+echo "9. Générateur IA et panier"
+check "accueil : formulaire du générateur" 'curl -s $BASE/ | grep -q "id=\"gen\""'
+check "description trop courte refusée" '[ "$(code "${H[@]}" -H "content-type: application/json" -X POST -d "{\"description\":\"abc\"}" $BASE/api/generer)" = 400 ]'
+check "générateur appelé d’une autre origine refusé" '[ "$(code -H "Origin: https://pirate.example" -H "content-type: application/json" -X POST -d "{}" $BASE/api/generer)" = 403 ]'
+GEN=$(curl -s "${H[@]}" -H "content-type: application/json" -X POST -d '{"description":"Je fais du monoï et des savons à Moorea","nom":"Vai Soins"}' "$BASE/api/generer")
+check "génération : modèle Tiare deviné, nom gardé" 'echo "$GEN" | grep -q "\"modele\":\"tiare\"" && echo "$GEN" | grep -q "Vai Soins"'
+APERCU=$(echo "$GEN" | grep -o '"apercu":"[^"]*"' | cut -d'"' -f4); CREER=$(echo "$GEN" | grep -o '"creer":"[^"]*"' | cut -d'"' -f4)
+check "aperçu en direct affichable dans l’accueil" 'curl -s -D - "$BASE$APERCU" | grep -qi "x-frame-options: SAMEORIGIN"'
+check "aperçu falsifié refusé" '[ "$(code "$BASE/apercu?g=nimporte")" = 404 ]'
+JG="$TMP/jg"; login "$JG" "gen$R@test.pf"
+G=$(echo "$CREER" | sed 's/.*g=//')
+check "formulaire de création pré-rempli par la génération" 'curl -s -b "$JG" "$BASE$CREER" | grep -q "value=\"Vai Soins\""'
+curl -s -o /dev/null -b "$JG" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Vai Soins" -d sous_domaine=vai-$R -d modele=tiare -d plan=plan_1 -d cgu=on --data-urlencode "g=$G"
+check "boutique créée avec les 4 produits générés" 'curl -s -b "$JG" $BASE/tableau-de-bord | grep -q "<b>4 / 9</b>"'
+check "vitrine générée avec ses textes" 'curl -s $BASE/b/vai-$R | grep -q "parfum du fenua"'
+check "panier en overlay présent dans une boutique qui vend" 'S=$(curl -s $BASE/b/$SLUG); echo "$S" | grep -q "id=\"cart-open\"" && echo "$S" | grep -q "data-add="'
+check "pas de panier tant qu’aucun paiement n’est configuré" '! curl -s $BASE/b/vai-$R | grep -q "id=\"cart-open\""'
+
+echo "10. Session"
 curl -s -o /dev/null -c "$J" "$BASE/deconnexion"
 check "déconnexion effective" '[[ "$(loc -b "$J" $BASE/tableau-de-bord)" == */connexion* ]]'
 check "cookie de session falsifié refusé" '[[ "$(loc -H "Cookie: hb_s=eyJlIjoiYWRtaW5AdGVzdC5wZiJ9.AAAA" $BASE/admin)" == */connexion* ]]'

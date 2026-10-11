@@ -89,7 +89,8 @@ function productCard(o, ctx) {
       ${o.description ? `<p class="desc">${para(o.description)}</p>` : ''}
       <div class="price">${fmtXpf(o.prix_xpf)}</div>
       ${orderable
-        ? `<label class="qty"><span>Quantité</span><input form="commande" name="q_${esc(o.id)}" type="number" min="0" max="${o.stock}" value="0" inputmode="numeric"></label>`
+        ? `<label class="qty"><span>Quantité</span><input form="commande" name="q_${esc(o.id)}" type="number" min="0" max="${o.stock}" value="0" inputmode="numeric" data-nom="${esc(o.nom)}" data-prix="${o.prix_xpf}"></label>
+           <button type="button" class="add" data-add="q_${esc(o.id)}">Ajouter au panier</button>`
         : `<span class="tag">${o.stock > 0 ? 'Sur demande' : 'Épuisé'}</span>`}
     </div></article>`;
 }
@@ -98,8 +99,9 @@ function orderForm(ctx) {
   if (!ctx.canOrder) return '';
   const dis = ctx.demo ? ' disabled' : '';
   return `<div class="order">
-    <h3>Passer commande</h3>
-    <p class="muted">Choisissez les quantités, puis vos coordonnées. Les instructions de paiement s’affichent à l’écran.</p>
+    <h3>Vos coordonnées</h3>
+    <p class="muted no-js-only">Choisissez les quantités ci-dessus, puis vos coordonnées.</p>
+    <p class="muted">Les instructions de paiement s’affichent à l’écran après validation.</p>
     <form id="commande" method="post" action="${esc(ctx.base)}/commander">
       <div class="row">
         <label>Nom complet<input name="client_nom" required maxlength="80"${dis}></label>

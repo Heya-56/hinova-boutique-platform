@@ -11,7 +11,9 @@ Plateforme de boutiques en ligne pour la Polynésie française. Un seul Worker C
 
 | Module | Détail |
 |---|---|
-| Accueil | Carrousel plein écran de 4 boutiques de démonstration (aperçus téléphone, glisser, flèches, clavier, lecture auto coupée au moindre geste) ; l'offre et les formules viennent ensuite |
+| Générateur IA | Le visiteur décrit son activité en une phrase : Workers AI (Llama 3.3 70B, sortie JSON) propose nom, modèle, couleurs, textes, sections et 4 à 6 produits ; aperçu en direct dans un téléphone ; la boutique créée reprend tout. Si l'IA est indisponible ou lente (15 s), une proposition automatique par mots-clés prend le relais, annoncée comme telle |
+| Accueil | Look « IA / tech » : générateur en tête, carrousel des 4 modèles, étapes, formules |
+| Panier | Bouton « Ajouter au panier », compteur, panneau latéral (quantités, total, coordonnées et validation), mémorisé sur le téléphone ; sans JavaScript, la commande classique reste disponible |
 | Connexion | Google uniquement (`utilisateurs.email_google`) ; session signée HMAC, 30 jours ; les e-mails de `ADMIN_EMAILS` deviennent administrateurs |
 | Création | Modèle, adresse, formule, cycle ; 14 jours offerts ; sections par défaut |
 | Modèles | Lagon, Pae, Tiare, Nuit : ambiance, typographie, arrondis ; couleurs principale et secondaire, logo |
@@ -51,6 +53,8 @@ URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback
 
 > Ne jamais définir `DEV_LOGIN` en production : il permet de se connecter sans Google.
 
+**Workers AI** : la liaison `AI` est déclarée dans `wrangler.toml`. Chaque génération consomme des « neurones » Workers AI ; l'offre gratuite en couvre un volume quotidien limité (voir la page de tarification Workers AI). Ajouter une règle de limitation de débit (WAF) sur `POST /api/generer`.
+
 ## Développement local
 
 ```bash
@@ -61,8 +65,8 @@ SESSION_SECRET="dev-secret-0123456789abcdef0123456789abcdef"
 DEV_LOGIN="1"
 ADMIN_EMAILS="admin@test.pf"
 EOF
-npm run dev                            # http://localhost:8787
-BASE=http://localhost:8787 npm test    # 53 vérifications de bout en bout
+npm run dev                            # http://localhost:8787 (environnement « test », sans Workers AI : la proposition automatique est utilisée)
+BASE=http://localhost:8787 npm test    # 64 vérifications de bout en bout
 ```
 
 ## Structure
@@ -71,7 +75,8 @@ BASE=http://localhost:8787 npm test    # 53 vérifications de bout en bout
 migrations/0001_initial_schema.sql         Schéma initial (boutiques, utilisateurs, offres, commandes, dossiers OSB, compteurs)
 migrations/0002_sections_contacts_paiements.sql  Ajouts : sections, contacts, moyens de paiement, infos de livraison
 src/index.js     Routage, connexion Google, tableau de bord, vitrines, factures, admin, tâche planifiée
-src/landing.js   Accueil en carrousel
+src/landing.js   Accueil : générateur IA et carrousel
+src/ai.js        Génération par Workers AI et proposition automatique de secours
 src/sections.js  Types de sections, validation, rendu
 src/editor.js    Éditeur de sections (navigateur)
 src/demo.js      Boutiques de démonstration
