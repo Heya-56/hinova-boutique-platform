@@ -1,28 +1,32 @@
-name = "hinova-boutiques"
+name = "hinova-boutique-platform"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
 
-# Suspension automatique des boutiques impayées : tous les jours à 6h (heure de Tahiti = 16h UTC)
+# Suspension automatique des boutiques impayées : chaque jour à 6h, heure de Tahiti (16h UTC)
 [triggers]
 crons = ["0 16 * * *"]
 
 [vars]
 BRAND = "Hinova Boutiques"
 SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
-# Domaine racine pour les sous-domaines (ex. maboutique.boutiques.hinovadigitalcorp.com). Vide = adresses /s/<slug> uniquement.
+# Domaine racine des boutiques : <boutique>.ROOT_DOMAIN. Vide = adresses /b/<boutique> uniquement.
 ROOT_DOMAIN = ""
 TRIAL_DAYS = "14"
 GRACE_DAYS = "3"
-# Liens de paiement d'abonnement (Stripe ou autre) affichés au commerçant — à renseigner
-PAY_LINK_MINI = ""
-PAY_LINK_STANDARD = ""
-PAY_LINK_PLUS = ""
-# Secret à définir avec : npx wrangler secret put ADMIN_TOKEN
+# Adresses Google qui deviennent administratrices à leur première connexion (séparées par des virgules)
+ADMIN_EMAILS = "heianui.tapare@hinovadigitalcorp.com"
+# Liens de paiement des abonnements, affichés au commerçant
+PAY_LINK_PLAN_1 = ""
+PAY_LINK_PLAN_2 = ""
+PAY_LINK_PLAN_3 = ""
+# Secrets (npx wrangler secret put …) : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SESSION_SECRET, OSB_WEBHOOK_URL (optionnel)
+# Ne JAMAIS définir DEV_LOGIN en production (connexion de test sans Google, réservée au poste local).
 
 [[d1_databases]]
 binding = "DB"
 database_name = "hinova_boutiques"
 database_id = "REMPLACER_PAR_ID_D1"
+migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "IMAGES"

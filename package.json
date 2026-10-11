@@ -1,13 +1,13 @@
 {
-  "name": "hinova-boutiques",
+  "name": "hinova-boutique-platform",
   "version": "1.0.0",
   "private": true,
   "description": "Générateur de boutiques en ligne multi-commerçants pour la Polynésie française — Cloudflare Workers + D1 + R2",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "db:local": "wrangler d1 execute hinova_boutiques --local --file=schema.sql",
-    "db:remote": "wrangler d1 execute hinova_boutiques --remote --file=schema.sql",
+    "db:local": "wrangler d1 migrations apply hinova_boutiques --local",
+    "db:remote": "wrangler d1 migrations apply hinova_boutiques --remote",
     "test": "bash test/smoke.sh",
     "deploy": "wrangler deploy"
   },

@@ -1,15 +1,24 @@
-// Hinova Boutiques — générateur de boutiques en ligne multi-commerçants (Cloudflare Workers + D1 + R2)
+// Hinova Boutique Platform — Worker mutualisé : accueil, vitrines, tableau de bord commerçant, admin Hinova.
+// Schéma : migrations/0001 (initial) + 0002 (sections, contacts, paiements).
 import {
-  esc, uid, token, hashPassword, safeEqual, slugify, RESERVED_SLUGS, html, redirect,
-  getCookie, setCookie, sameOrigin, nowIso, addDays, addMonths, fmtXpf, fmtDate, monthStartSql, int, clean,
+  esc, jsonForScript, uid, b64urlDecode, sign, verify, slugify, RESERVED, html, redirect, withMsg,
+  getCookie, setCookie, sameOrigin, readForm, safeNext, nowIso, addDays, addMonths, monthKey, yearKey, monthStartSql,
+  fmtXpf, fmtDate, int, clean, isHttps, isColor, isEmail,
 } from './lib.js';
-import { PLANS, getPlan, annualPrice, PAYMENT_METHODS, ORDER_STATUSES, ISLANDS } from './plans.js';
-import { page, flash, dashNav, meter, THEME_NAMES } from './views.js';
+import {
+  PLANS, getPlan, annualPrice, MODELES, getModele, PAYMENT_METHODS, ORDER_STATUSES, NEXT_STATUS, BANQUES, OSB_STATUTS, ISLANDS,
+} from './plans.js';
+import { appPage, storePage, storeColors, flash, dashNav, adminNav, meter } from './views.js';
+import { SECTION_TYPES, defaultSections, sanitizeSections, parseSections, renderSections } from './sections.js';
+import { DEMOS, demoBoutique } from './demo.js';
+import { illu } from './art.js';
+import { EDITOR_JS, EDITOR_CSS } from './editor.js';
+import { landingPage } from './landing.js';
 
-const SESSION_COOKIE = 'hb_session';
-const ADMIN_COOKIE = 'hb_admin';
+const SESSION = 'hb_s';
+const OAUTH = 'hb_oauth';
 const SESSION_DAYS = 30;
-const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_IMAGE = 2 * 1024 * 1024;
 const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
 
 export default {
@@ -18,12 +27,10 @@ export default {
       return await route(request, env);
     } catch (e) {
       console.error(e && e.stack ? e.stack : e);
-      return html(page({ title: 'Erreur', body: '<div class="card"><h1>Une erreur est survenue</h1><p class="muted">Réessayez dans un instant. Si le problème persiste, contactez le support.</p></div>' }), 500);
+      return html(appPage({ title: 'Erreur', body: '<div class="card"><h1>Une erreur est survenue</h1><p class="muted">Réessayez dans un instant. Si le problème persiste, écrivez au support.</p></div>' }), 500);
     }
   },
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(suspendOverdue(env));
-  },
+  async scheduled(_e, env, ctx) { ctx.waitUntil(suspendOverdue(env)); },
 };
 
 // ───────────────────────────── Routage ─────────────────────────────
@@ -33,726 +40,837 @@ async function route(request, env) {
   const method = request.method;
   if (method === 'POST' && !sameOrigin(request)) return new Response('Origine refusée', { status: 403 });
 
-  // Sous-domaine boutique : <slug>.<ROOT_DOMAIN>
+  // Boutique servie sur son propre sous-domaine : <boutique>.<ROOT_DOMAIN>
   const root = (env.ROOT_DOMAIN || '').toLowerCase();
   const host = url.hostname.toLowerCase();
-  if (root && host.endsWith('.' + root)) {
-    const sub = host.slice(0, -(root.length + 1));
-    if (sub && sub !== 'www' && !sub.includes('.')) {
-      if (url.pathname.startsWith('/img/')) return serveImage(url, env);
-      return storefront(request, env, url, sub, url.pathname, '');
-    }
+  if (root && host.endsWith('.' + root) && host !== 'www.' + root) {
+    if (url.pathname.startsWith('/img/')) return serveImage(url, env);
+    return storefront(request, env, url, host, url.pathname, '');
   }
 
   const p = url.pathname.replace(/\/+$/, '') || '/';
-  const parts = p.split('/').filter(Boolean);
+  let parts;
+  try { parts = p.split('/').filter(Boolean).map(decodeURIComponent); } catch { return notFound(); }
 
-  if (p === '/') return landing(env);
-  if (p === '/robots.txt') return new Response('User-agent: *\nDisallow: /tableau-de-bord\nDisallow: /admin\n');
+  if (p === '/') return html(landingPage(env), 200, { 'cache-control': 'public, max-age=300' });
+  if (p === '/robots.txt') return new Response('User-agent: *\nDisallow: /tableau-de-bord\nDisallow: /admin\nDisallow: /f/\n');
+  if (p === '/static/editeur.js') return new Response(EDITOR_JS, { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=3600' } });
   if (parts[0] === 'img') return serveImage(url, env);
-  if (parts[0] === 's' && parts[1]) {
+  if (parts[0] === 'demo' && parts[1]) return demoStore(parts[1]);
+  if (parts[0] === 'b' && parts[1]) {
     const sub = '/' + parts.slice(2).join('/');
-    return storefront(request, env, url, parts[1], sub === '/' ? '/' : sub, `/s/${parts[1]}`);
+    return storefront(request, env, url, parts[1], sub, `/b/${encodeURIComponent(parts[1])}`);
   }
+  if (parts[0] === 'f' && parts[1]) return invoicePage(env, parts[1]);
 
-  if (p === '/inscription') return method === 'POST' ? signupPost(request, env) : signupForm(env, url);
-  if (p === '/connexion') return method === 'POST' ? loginPost(request, env) : loginForm(url);
-  if (p === '/deconnexion') return logout(request, env);
+  if (p === '/connexion') return loginPage(env, url);
+  if (p === '/auth/google') return googleStart(request, env, url);
+  if (p === '/auth/google/callback') return googleCallback(request, env, url);
+  if (p === '/auth/dev') return devLogin(request, env, url);
+  if (p === '/deconnexion') return redirect('/', { 'set-cookie': setCookie(SESSION, '', 0) });
+
+  if (p === '/demarrer') return method === 'POST' ? onboardingPost(request, env, url) : onboardingForm(request, env, url);
 
   if (parts[0] === 'tableau-de-bord') {
-    const tenant = await currentTenant(request, env);
-    if (!tenant) return redirect('/connexion');
-    return dashboard(request, env, url, tenant, parts.slice(1));
+    const who = await currentUser(request, env);
+    if (!who) return redirect('/connexion?next=' + encodeURIComponent(p));
+    if (who.user?.role === 'admin') return redirect('/admin');
+    if (!who.user) return redirect('/demarrer');
+    const b = await env.DB.prepare('SELECT * FROM boutiques WHERE id = ?').bind(who.user.boutique_id).first();
+    if (!b) return redirect('/demarrer');
+    return dashboard(request, env, url, b, who, parts.slice(1));
   }
 
-  if (parts[0] === 'admin') return admin(request, env, url, parts.slice(1));
+  if (parts[0] === 'admin') {
+    const who = await currentUser(request, env);
+    if (!who) return redirect('/connexion?next=/admin');
+    if (who.user?.role !== 'admin') return notFound();
+    return admin(request, env, url, parts.slice(1));
+  }
 
   return notFound();
 }
 
-function notFound() {
-  return html(page({ title: 'Page introuvable', body: '<div class="card"><h1>Page introuvable</h1><p><a href="/">Retour à l’accueil</a></p></div>' }), 404);
+const notFound = () => html(appPage({ title: 'Page introuvable', body: '<div class="card"><h1>Page introuvable</h1><p><a href="/">Retour à l’accueil</a></p></div>' }), 404);
+
+// ───────────────────────────── Authentification Google ─────────────────────────────
+
+function needSecret(env) {
+  if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET manquant ou trop court (32 caractères minimum).');
 }
 
-// ───────────────────────────── Accueil & offres ─────────────────────────────
-
-function plansHtml(cta = true) {
-  return `<div class="plans">${Object.values(PLANS).map((pl) => `
-    <div class="card plan">
-      <h3>${esc(pl.label)}</h3>
-      <div class="p">${fmtXpf(pl.monthly)}<span class="muted small"> / mois</span></div>
-      <p class="muted small">ou ${fmtXpf(annualPrice(pl))} / an (2 mois offerts)</p>
-      <ul><li>${pl.maxProducts} produits maximum</li><li>${pl.salesQuota} ventes / mois incluses</li><li>Gestion du stock</li><li>Bon de commande et étiquette postale</li><li>Paiement versé directement sur votre compte</li></ul>
-      ${cta ? `<a class="btn" href="/inscription?plan=${pl.key}">Choisir</a>` : ''}
-    </div>`).join('')}</div>`;
+async function currentUser(request, env) {
+  needSecret(env);
+  const s = await verify(getCookie(request, SESSION), env.SESSION_SECRET);
+  if (!s?.e) return null;
+  const user = await env.DB.prepare('SELECT * FROM utilisateurs WHERE email_google = ?').bind(s.e).first();
+  return { email: s.e, user };
 }
 
-function landing(env) {
-  const body = `
-  <section class="hero">
-    <h1>Votre boutique en ligne prête en 10 minutes.</h1>
-    <p>Choisissez un modèle, ajoutez vos produits depuis votre téléphone, partagez votre lien. Vos clients paient directement sur votre compte, par virement, au guichet ou par carte via OSB.</p>
-    <a class="btn" href="/inscription">Créer ma boutique — ${esc(env.TRIAL_DAYS || '14')} jours offerts</a>
-    <a class="btn ghost" href="/connexion">J’ai déjà une boutique</a>
-  </section>
-  <h2 style="margin-top:34px">Les formules</h2>
-  ${plansHtml()}
-  <p class="muted small">Besoin de plus de produits ou d’un site sur mesure ? Écrivez à <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a>. Ouverture du paiement par carte (dossier OSB / PayZen) sur demande au support.</p>`;
-  return html(page({ title: `${env.BRAND} — boutiques en ligne pour la Polynésie`, body, description: 'Créez votre boutique en ligne en Polynésie française : modèles prêts à l’emploi, paiement direct au commerçant.' }));
+async function openSession(env, email, next) {
+  needSecret(env);
+  const e = email.toLowerCase();
+  const admins = String(env.ADMIN_EMAILS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+  if (admins.includes(e)) await env.DB.prepare(`INSERT OR IGNORE INTO utilisateurs (email_google, role) VALUES (?, 'admin')`).bind(e).run();
+  const tok = await sign({ e, x: Date.now() + SESSION_DAYS * 86400000 }, env.SESSION_SECRET);
+  return redirect(safeNext(next), { 'set-cookie': setCookie(SESSION, tok, SESSION_DAYS * 86400) });
 }
 
-// ───────────────────────────── Comptes commerçants ─────────────────────────────
-
-function signupForm(env, url, values = {}) {
-  const plan = values.plan || url.searchParams.get('plan') || 'mini';
-  const body = `<div class="card" style="max-width:560px;margin:0 auto">
-    <h1>Créer ma boutique</h1>${flash(url)}
-    <form method="post">
-      <label for="name">Nom de la boutique</label><input id="name" name="name" required maxlength="60" value="${esc(values.name)}">
-      <label for="slug">Adresse de la boutique</label><input id="slug" name="slug" maxlength="40" placeholder="ex. te-mira-tahiti" value="${esc(values.slug)}">
-      <p class="muted small">Lettres, chiffres et tirets. Laissez vide pour la générer depuis le nom.</p>
-      <label for="email">E-mail</label><input id="email" name="email" type="email" required value="${esc(values.email)}">
-      <label for="password">Mot de passe (8 caractères minimum)</label><input id="password" name="password" type="password" minlength="8" required>
-      <div class="row">
-        <div><label for="plan">Formule</label><select id="plan" name="plan">${Object.values(PLANS).map((p) => `<option value="${p.key}" ${p.key === plan ? 'selected' : ''}>${esc(p.label)} — ${fmtXpf(p.monthly)}/mois</option>`).join('')}</select></div>
-        <div><label for="billing">Facturation</label><select id="billing" name="billing"><option value="mensuel">Mensuelle</option><option value="annuel" ${values.billing === 'annuel' ? 'selected' : ''}>Annuelle (2 mois offerts)</option></select></div>
-      </div>
-      <label style="font-weight:400"><input type="checkbox" name="cgu" required style="width:auto"> J’accepte les conditions générales d’utilisation. En cas d’impayé, la boutique est mise hors ligne jusqu’à régularisation.</label>
-      <button class="btn" type="submit">Créer ma boutique — ${esc(env.TRIAL_DAYS || '14')} jours offerts</button>
-    </form>
-    <p class="small muted">Déjà inscrit ? <a href="/connexion">Se connecter</a></p></div>`;
-  return html(page({ title: 'Créer ma boutique', body }));
+function loginPage(env, url) {
+  const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
+  const dev = env.DEV_LOGIN === '1' ? `<form method="get" action="/auth/dev" class="card" style="margin-top:16px;border-style:dashed">
+      <p class="small muted">Mode développement (désactivé en production)</p><input type="hidden" name="next" value="${esc(next)}">
+      <label for="de">E-mail de test</label><input id="de" name="email" type="email" required><button class="btn small" style="margin-top:10px">Connexion test</button></form>` : '';
+  const body = `<div style="max-width:440px;margin:30px auto">${flash(url)}<div class="card" style="text-align:center">
+    <h1>Connexion</h1><p class="muted">Un seul compte Google pour gérer votre boutique, sans mot de passe à retenir.</p>
+    <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a></div>${dev}</div>`;
+  return html(appPage({ title: 'Connexion', body }));
 }
 
-async function signupPost(request, env) {
-  const f = await readForm(request);
-  const values = {
-    name: clean(f.get('name'), 60), slug: slugify(f.get('slug') || f.get('name')),
-    email: clean(f.get('email'), 120).toLowerCase(), plan: PLANS[f.get('plan')] ? f.get('plan') : 'mini',
-    billing: f.get('billing') === 'annuel' ? 'annuel' : 'mensuel',
-  };
-  const password = String(f.get('password') || '');
-  const fail = (msg) => {
-    const u = new URL(request.url); u.searchParams.set('err', msg);
-    return signupForm(env, u, values);
-  };
-  if (!values.name) return fail('Indiquez le nom de la boutique.');
-  if (!values.slug || values.slug.length < 3 || RESERVED_SLUGS.has(values.slug)) return fail('Cette adresse de boutique n’est pas disponible.');
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(values.email)) return fail('Adresse e-mail invalide.');
-  if (password.length < 8) return fail('Le mot de passe doit faire au moins 8 caractères.');
-  if (!f.get('cgu')) return fail('Merci d’accepter les conditions générales.');
+const GOOGLE_G = '<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.5l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.8 6C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.4 5.7c4.3-4 6.9-9.9 6.9-17z"/><path fill="#FBBC05" d="M10.5 28.7A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.7l-7.8-6A24 24 0 0 0 0 24c0 3.9.9 7.5 2.6 10.7l7.9-6z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.4-5.7c-2.1 1.4-4.8 2.3-8.5 2.3-6.3 0-11.6-4.2-13.5-9.9l-7.9 6C6.6 42.6 14.6 48 24 48z"/></svg>';
 
-  const exists = await env.DB.prepare('SELECT slug, email FROM tenants WHERE slug = ? OR email = ?').bind(values.slug, values.email).first();
-  if (exists) return fail(exists.email === values.email ? 'Un compte existe déjà avec cet e-mail.' : 'Cette adresse de boutique est déjà prise.');
-
-  const { hash, salt } = await hashPassword(password);
-  const id = uid('t_');
-  const paidUntil = addDays(nowIso(), int(env.TRIAL_DAYS, 14));
-  await env.DB.batch([
-    env.DB.prepare(`INSERT INTO tenants (id, slug, name, email, password_hash, salt, plan, billing, status, paid_until)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'essai', ?)`).bind(id, values.slug, values.name, values.email, hash, salt, values.plan, values.billing, paidUntil),
-    env.DB.prepare(`INSERT INTO billing_events (id, tenant_id, kind, detail) VALUES (?, ?, 'essai', ?)`).bind(uid('b_'), id, `Essai jusqu'au ${paidUntil.slice(0, 10)}`),
-  ]);
-  return startSession(env, id, '/tableau-de-bord?ok=' + encodeURIComponent('Bienvenue ! Complétez votre boutique en 3 étapes ci-dessous.'));
+async function googleStart(request, env, url) {
+  if (!env.GOOGLE_CLIENT_ID) return redirect(withMsg('/connexion', 'err', 'Connexion Google non configurée (GOOGLE_CLIENT_ID).'));
+  needSecret(env);
+  const state = uid();
+  const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
+  const cookie = await sign({ s: state, n: next, x: Date.now() + 600000 }, env.SESSION_SECRET);
+  const q = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID, redirect_uri: `${url.origin}/auth/google/callback`, response_type: 'code',
+    scope: 'openid email', state, prompt: 'select_account',
+  });
+  return redirect(`https://accounts.google.com/o/oauth2/v2/auth?${q}`, { 'set-cookie': setCookie(OAUTH, cookie, 600) });
 }
 
-function loginForm(url) {
-  const body = `<div class="card" style="max-width:440px;margin:0 auto">
-    <h1>Connexion</h1>${flash(url)}
-    <form method="post">
-      <label for="email">E-mail</label><input id="email" name="email" type="email" required>
-      <label for="password">Mot de passe</label><input id="password" name="password" type="password" required>
-      <button class="btn" type="submit">Se connecter</button>
-    </form>
-    <p class="small muted">Pas encore de boutique ? <a href="/inscription">Créer ma boutique</a></p></div>`;
-  return html(page({ title: 'Connexion', body }));
-}
-
-async function loginPost(request, env) {
-  const f = await readForm(request);
-  const email = clean(f.get('email'), 120).toLowerCase();
-  const password = String(f.get('password') || '');
-  const t = await env.DB.prepare('SELECT id, password_hash, salt FROM tenants WHERE email = ?').bind(email).first();
-  // On calcule toujours un hash pour ne pas révéler l'existence du compte par le temps de réponse
-  const { hash } = await hashPassword(password, t ? t.salt : 'leurre-sel-constant');
-  if (!t || !safeEqual(hash, t.password_hash)) return redirect('/connexion?err=' + encodeURIComponent('E-mail ou mot de passe incorrect.'));
-  return startSession(env, t.id, '/tableau-de-bord');
-}
-
-async function startSession(env, tenantId, to) {
-  const tok = token();
-  await env.DB.prepare('INSERT INTO sessions (token, tenant_id, expires_at) VALUES (?, ?, ?)').bind(tok, tenantId, addDays(nowIso(), SESSION_DAYS)).run();
-  return redirect(to, { 'set-cookie': setCookie(SESSION_COOKIE, tok, SESSION_DAYS * 86400) });
-}
-
-async function logout(request, env) {
-  const tok = getCookie(request, SESSION_COOKIE);
-  if (tok) await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(tok).run();
-  return redirect('/connexion?ok=' + encodeURIComponent('Vous êtes déconnecté.'), { 'set-cookie': setCookie(SESSION_COOKIE, '', 0) });
-}
-
-async function currentTenant(request, env) {
-  const tok = getCookie(request, SESSION_COOKIE);
-  if (!tok) return null;
-  return env.DB.prepare(`SELECT t.* FROM sessions s JOIN tenants t ON t.id = s.tenant_id WHERE s.token = ? AND s.expires_at > ?`).bind(tok, nowIso()).first();
-}
-
-// ───────────────────────────── Statut & quotas ─────────────────────────────
-
-function isOffline(tenant, env) {
-  if (tenant.status === 'suspendu') return true;
-  return new Date(addDays(tenant.paid_until, int(env.GRACE_DAYS, 3))) < new Date();
-}
-
-async function usage(env, tenantId) {
-  const r = await env.DB.prepare(`SELECT
-      (SELECT COUNT(*) FROM products WHERE tenant_id = ?1) AS products,
-      (SELECT COUNT(*) FROM orders WHERE tenant_id = ?1 AND status != 'annulee' AND created_at >= ?2) AS sales,
-      (SELECT COALESCE(SUM(total_xpf),0) FROM orders WHERE tenant_id = ?1 AND status IN ('payee','expediee') AND created_at >= ?2) AS revenue,
-      (SELECT COUNT(*) FROM orders WHERE tenant_id = ?1 AND status = 'en_attente') AS pending,
-      (SELECT COUNT(*) FROM orders WHERE tenant_id = ?1 AND over_quota = 1 AND status != 'annulee' AND created_at >= ?2) AS overQuota`)
-    .bind(tenantId, monthStartSql()).first();
+async function googleCallback(request, env, url) {
+  needSecret(env);
+  const saved = await verify(getCookie(request, OAUTH), env.SESSION_SECRET);
+  const fail = (m) => redirect(withMsg('/connexion', 'err', m), { 'set-cookie': setCookie(OAUTH, '', 0) });
+  if (!saved || saved.s !== url.searchParams.get('state')) return fail('Session de connexion expirée, réessayez.');
+  const code = url.searchParams.get('code');
+  if (!code) return fail('Connexion annulée.');
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, redirect_uri: `${url.origin}/auth/google/callback`, grant_type: 'authorization_code' }),
+  });
+  if (!res.ok) return fail('Google a refusé la connexion.');
+  const { id_token } = await res.json();
+  // Jeton reçu directement de Google en HTTPS : on contrôle l'audience, l'émetteur, l'expiration et la vérification de l'e-mail.
+  let c;
+  try { c = JSON.parse(new TextDecoder().decode(b64urlDecode(id_token.split('.')[1]))); } catch { return fail('Réponse Google illisible.'); }
+  if (c.aud !== env.GOOGLE_CLIENT_ID || !['accounts.google.com', 'https://accounts.google.com'].includes(c.iss) || c.exp * 1000 < Date.now() || !c.email_verified || !c.email) {
+    return fail('Compte Google non vérifié.');
+  }
+  const r = await openSession(env, c.email, saved.n);
+  r.headers.append('set-cookie', setCookie(OAUTH, '', 0));
   return r;
 }
 
-function paymentMethodsOf(t) {
+async function devLogin(request, env, url) {
+  if (env.DEV_LOGIN !== '1') return notFound();
+  const email = clean(url.searchParams.get('email'), 120).toLowerCase();
+  if (!isEmail(email)) return redirect(withMsg('/connexion', 'err', 'E-mail invalide.'));
+  return openSession(env, email, url.searchParams.get('next') || '/tableau-de-bord');
+}
+
+// ───────────────────────────── Création de boutique ─────────────────────────────
+
+async function onboardingForm(request, env, url, values = {}) {
+  const who = await currentUser(request, env);
+  const modele = MODELES[values.modele || url.searchParams.get('modele')] ? (values.modele || url.searchParams.get('modele')) : 'lagon';
+  const plan = PLANS[values.plan || url.searchParams.get('plan')] ? (values.plan || url.searchParams.get('plan')) : 'plan_1';
+  if (!who) {
+    const next = `/demarrer?modele=${modele}&plan=${plan}`;
+    const body = `<div style="max-width:480px;margin:30px auto" class="card"><h1>Créer ma boutique</h1>
+      <p>Modèle choisi : <b>${esc(getModele(modele).label)}</b>. Connectez-vous avec Google pour continuer : c’est votre compte de gestion.</p>
+      <a class="btn google" href="/connexion?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>
+      <p class="small muted"><a href="/">← Revoir les modèles</a></p></div>`;
+    return html(appPage({ title: 'Créer ma boutique', body }));
+  }
+  if (who.user?.role === 'admin') return redirect('/admin');
+  if (who.user) return redirect('/tableau-de-bord');
+  const suffix = env.ROOT_DOMAIN ? `.${esc(env.ROOT_DOMAIN)}` : '';
+  const body = `<div class="card" style="max-width:640px;margin:0 auto">
+    <h1>Créer ma boutique</h1>${flash(url)}
+    <p class="muted small">Connecté avec ${esc(who.email)} · <a href="/deconnexion">changer de compte</a></p>
+    <form method="post">
+      <label for="nom">Nom de la boutique</label><input id="nom" name="nom" required maxlength="60" value="${esc(values.nom)}">
+      <label for="sd">Adresse de la boutique</label><input id="sd" name="sous_domaine" maxlength="40" placeholder="ex. te-mira" value="${esc(values.sous_domaine)}">
+      <p class="small muted">Votre boutique sera à l’adresse <b>${env.ROOT_DOMAIN ? 'nom' + suffix : '/b/nom'}</b>. Lettres, chiffres et tirets ; laissez vide pour la créer depuis le nom.</p>
+      <label>Modèle</label>
+      <div class="modeles">${Object.entries(MODELES).map(([k, m]) => `<label><input type="radio" name="modele" value="${k}" ${k === modele ? 'checked' : ''}> ${m.label}
+        <div class="swatch"><i style="background:${m.tokens.bg}"></i><i style="background:${m.primary}"></i><i style="background:${m.secondary}"></i></div></label>`).join('')}</div>
+      <div class="row">
+        <div><label for="plan">Formule</label><select id="plan" name="plan">${Object.values(PLANS).map((pl) => `<option value="${pl.key}" ${pl.key === plan ? 'selected' : ''}>${esc(pl.label)} — ${fmtXpf(pl.monthly)}/mois · ${pl.maxProducts} produits</option>`).join('')}</select></div>
+        <div><label for="cycle">Facturation</label><select id="cycle" name="cycle"><option value="mensuel">Mensuelle</option><option value="annuel" ${values.cycle === 'annuel' ? 'selected' : ''}>Annuelle (2 mois offerts)</option></select></div>
+      </div>
+      <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="cgu" required style="margin-top:5px"> J’accepte les conditions générales. En cas d’abonnement impayé, la boutique est mise hors ligne jusqu’à régularisation.</label>
+      <button class="btn" type="submit">Créer ma boutique — ${esc(env.TRIAL_DAYS || '14')} jours offerts</button>
+    </form></div>`;
+  return html(appPage({ title: 'Créer ma boutique', body }));
+}
+
+async function onboardingPost(request, env, url) {
+  const who = await currentUser(request, env);
+  if (!who) return redirect('/connexion?next=/demarrer');
+  if (who.user) return redirect(who.user.role === 'admin' ? '/admin' : '/tableau-de-bord');
+  const f = await readForm(request);
+  const values = {
+    nom: clean(f.get('nom'), 60), sous_domaine: slugify(f.get('sous_domaine') || f.get('nom')),
+    modele: MODELES[f.get('modele')] ? f.get('modele') : 'lagon', plan: PLANS[f.get('plan')] ? f.get('plan') : 'plan_1',
+    cycle: f.get('cycle') === 'annuel' ? 'annuel' : 'mensuel',
+  };
+  const fail = (m) => { const u = new URL(url); u.searchParams.set('err', m); return onboardingForm(request, env, u, values); };
+  if (!values.nom) return fail('Indiquez le nom de la boutique.');
+  if (values.sous_domaine.length < 3 || RESERVED.has(values.sous_domaine)) return fail('Cette adresse n’est pas disponible (3 caractères minimum).');
+  if (!f.get('cgu')) return fail('Merci d’accepter les conditions générales.');
+  const domaine = env.ROOT_DOMAIN ? `${values.sous_domaine}.${env.ROOT_DOMAIN.toLowerCase()}` : values.sous_domaine;
+  if (await env.DB.prepare('SELECT 1 FROM boutiques WHERE domaine = ?').bind(domaine).first()) return fail('Cette adresse de boutique est déjà prise.');
+
+  const m = getModele(values.modele);
+  const id = uid();
+  const echeance = addDays(nowIso(), int(env.TRIAL_DAYS, 14));
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json)
+      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`)
+      .bind(id, values.nom, domaine, values.modele, echeance, values.plan, values.cycle, m.primary, m.secondary, JSON.stringify(defaultSections({ nom: values.nom }))),
+    env.DB.prepare(`INSERT INTO utilisateurs (email_google, boutique_id, role) VALUES (?, ?, 'client')`).bind(who.email, id),
+  ]);
+  return redirect(withMsg('/tableau-de-bord', 'ok', 'Bienvenue ! Votre boutique est créée. Suivez les étapes ci-dessous pour l’ouvrir.'));
+}
+
+// ───────────────────────────── Règles métier ─────────────────────────────
+
+function isOffline(b, env) {
+  if (b.statut === 'suspendue') return true;
+  if (!b.date_echeance) return false;
+  return new Date(addDays(b.date_echeance, int(env.GRACE_DAYS, 3))) < new Date();
+}
+
+function methodsOf(b) {
   const m = [];
-  if (t.bank_details) m.push('virement');
-  if (t.ccp_details) m.push('ccp');
-  if (t.osb_link) m.push('carte');
+  if (b.lien_paiement_carte) m.push('carte');
+  if (b.rib) m.push('virement');
+  if (b.consignes_ccp) m.push('ccp');
   return m;
 }
 
-function shopUrl(env, t, origin) {
-  return env.ROOT_DOMAIN ? `https://${t.slug}.${env.ROOT_DOMAIN}` : `${origin}/s/${t.slug}`;
+const storeUrl = (env, b, origin) => (env.ROOT_DOMAIN && b.domaine.includes('.') ? `https://${b.domaine}` : `${origin}/b/${encodeURIComponent(b.domaine)}`);
+
+async function usage(env, b) {
+  const r = await env.DB.prepare(`SELECT
+      (SELECT COUNT(*) FROM offres WHERE boutique_id = ?1) AS offres,
+      (SELECT COALESCE(ventes_count, 0) FROM ventes_mensuelles WHERE boutique_id = ?1 AND mois = ?2) AS ventes,
+      (SELECT COALESCE(SUM(total_xpf), 0) FROM commandes WHERE boutique_id = ?1 AND statut IN ('payee','expediee') AND cree_le >= ?3) AS ca,
+      (SELECT COUNT(*) FROM commandes WHERE boutique_id = ?1 AND statut = 'en_attente') AS attente,
+      (SELECT COUNT(*) FROM commandes WHERE boutique_id = ?1 AND statut = 'payee') AS a_expedier`)
+    .bind(b.id, monthKey(), monthStartSql()).first();
+  return { ...r, ventes: r.ventes || 0 };
 }
 
-// ───────────────────────────── Tableau de bord ─────────────────────────────
-
-async function dashboard(request, env, url, t, sub) {
-  const method = request.method;
-  const [section, id, action] = sub;
-
-  if (!section) return dashHome(env, url, t);
-  if (section === 'boutique') return method === 'POST' ? shopSettingsPost(request, env, t) : shopSettingsForm(url, t);
-  if (section === 'produits') {
-    if (!id) return method === 'POST' ? productCreate(request, env, t) : productList(env, url, t);
-    if (action === 'supprimer' && method === 'POST') return productDelete(env, t, id);
-    return method === 'POST' ? productUpdate(request, env, t, id) : productEditForm(env, url, t, id);
-  }
-  if (section === 'commandes') {
-    if (!id) return orderList(env, url, t);
-    if (action === 'statut' && method === 'POST') return orderStatus(request, env, t, id);
-    return orderSlip(env, t, id);
-  }
-  return notFound();
-}
-
-async function dashHome(env, url, t) {
-  const plan = getPlan(t.plan);
-  const u = await usage(env, t.id);
-  const offline = isOffline(t, env);
-  const methods = paymentMethodsOf(t);
-  const link = shopUrl(env, t, url.origin);
-  const payLink = env['PAY_LINK_' + plan.key.toUpperCase()];
-  const steps = [
-    [methods.length > 0, 'Indiquez au moins un moyen de paiement (RIB, guichet ou lien OSB)', '/tableau-de-bord/boutique'],
-    [u.products > 0, 'Ajoutez votre premier produit', '/tableau-de-bord/produits'],
-    [!!(t.phone || t.whatsapp), 'Ajoutez un numéro de contact', '/tableau-de-bord/boutique'],
-  ];
-  const todo = steps.filter((s) => !s[0]);
-  const body = `${flash(url)}
-  ${offline ? `<div class="flash err"><b>Votre boutique est hors ligne</b> : l’abonnement n’est pas à jour. Réglez votre abonnement pour la remettre en ligne immédiatement.</div>` : ''}
-  <div class="card">
-    <h1>${esc(t.name)}</h1>
-    <p>Votre boutique : <a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a></p>
-    <p><span class="badge ${esc(t.status)}">${esc({ essai: 'Période d’essai', actif: 'Actif', suspendu: 'Suspendu' }[t.status] || t.status)}</span>
-    <span class="muted small">· ${esc(plan.label)} · ${t.billing === 'annuel' ? 'annuel' : 'mensuel'} · réglé jusqu’au ${fmtDate(t.paid_until)}</span></p>
-  </div>
-  ${todo.length ? `<div class="card"><h2>À faire pour ouvrir votre boutique</h2><ol>${todo.map((s) => `<li><a href="${s[2]}">${s[1]}</a></li>`).join('')}</ol></div>` : ''}
-  <div class="stats">
-    <div class="stat"><b>${u.products} / ${plan.maxProducts}</b><span>produits</span>${meter(u.products, plan.maxProducts)}</div>
-    <div class="stat"><b>${u.sales} / ${plan.salesQuota}</b><span>ventes ce mois</span>${meter(u.sales, plan.salesQuota)}</div>
-    <div class="stat"><b>${fmtXpf(u.revenue)}</b><span>encaissé ce mois</span></div>
-    <div class="stat"><b>${u.pending}</b><span>commande(s) à traiter</span></div>
-  </div>
-  ${u.overQuota > 0 ? `<div class="flash err">${u.overQuota} vente(s) ce mois au-delà de votre quota. Elles seront facturées en supplément, ou passez à la formule supérieure.</div>` : ''}
-  <div class="card">
-    <h2>Mon abonnement</h2>
-    <p>${esc(plan.label)} : <b>${fmtXpf(plan.monthly)}</b> / mois ou <b>${fmtXpf(annualPrice(plan))}</b> / an.</p>
-    ${payLink ? `<a class="btn" href="${esc(payLink)}" target="_blank" rel="noopener">Régler mon abonnement</a>` : `<p class="muted">Pour régler votre abonnement, contactez <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a>.</p>`}
-    <p class="small muted">Changer de formule ou ouvrir le paiement par carte (dossier OSB) : <a href="mailto:${esc(env.SUPPORT_EMAIL)}?subject=${encodeURIComponent('Boutique ' + t.slug)}">écrire au support</a>.</p>
-  </div>`;
-  return html(page({ title: 'Tableau de bord', body, nav: dashNav('/tableau-de-bord'), brandHref: '/tableau-de-bord' }));
-}
-
-function shopSettingsForm(url, t) {
-  const body = `${flash(url)}<div class="card"><h1>Ma boutique</h1>
-  <form method="post">
-    <div class="row">
-      <div><label for="name">Nom</label><input id="name" name="name" required maxlength="60" value="${esc(t.name)}"></div>
-      <div><label for="theme">Modèle graphique</label><select id="theme" name="theme">${Object.entries(THEME_NAMES).map(([k, v]) => `<option value="${k}" ${k === t.theme ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
-    </div>
-    <label for="tagline">Phrase d’accroche</label><input id="tagline" name="tagline" maxlength="140" value="${esc(t.tagline)}">
-    <div class="row">
-      <div><label for="phone">Téléphone</label><input id="phone" name="phone" maxlength="30" value="${esc(t.phone)}"></div>
-      <div><label for="whatsapp">WhatsApp (format international, ex. 68989123456)</label><input id="whatsapp" name="whatsapp" maxlength="20" value="${esc(t.whatsapp)}"></div>
-      <div><label for="island">Île</label><select id="island" name="island"><option value=""></option>${ISLANDS.map((i) => `<option ${i === t.island ? 'selected' : ''}>${i}</option>`).join('')}</select></div>
-    </div>
-    <h2 style="margin-top:22px">Moyens de paiement</h2>
-    <p class="muted small">L’argent va directement sur votre compte. Remplissez au moins un moyen.</p>
-    <label for="bank_details">Virement : votre RIB (titulaire, banque, IBAN)</label><textarea id="bank_details" name="bank_details" maxlength="600">${esc(t.bank_details)}</textarea>
-    <label for="ccp_details">Espèces au guichet (CCP / Marara Paiement) : vos consignes</label><textarea id="ccp_details" name="ccp_details" maxlength="600">${esc(t.ccp_details)}</textarea>
-    <label for="osb_link">Carte bancaire : lien de paiement fourni par OSB / PayZen (https://…)</label><input id="osb_link" name="osb_link" maxlength="500" value="${esc(t.osb_link)}">
-    <label for="pickup_info">Livraison / retrait (délais, envoi postal, point de retrait)</label><textarea id="pickup_info" name="pickup_info" maxlength="600">${esc(t.pickup_info)}</textarea>
-    <button class="btn" type="submit">Enregistrer</button>
-  </form></div>`;
-  return html(page({ title: 'Ma boutique', body, nav: dashNav('/tableau-de-bord/boutique'), brandHref: '/tableau-de-bord' }));
-}
-
-async function shopSettingsPost(request, env, t) {
-  const f = await readForm(request);
-  const osb = clean(f.get('osb_link'), 500);
-  if (osb && !/^https:\/\/[^\s]+$/.test(osb)) return redirect('/tableau-de-bord/boutique?err=' + encodeURIComponent('Le lien OSB doit commencer par https://'));
-  const theme = THEME_NAMES[f.get('theme')] ? f.get('theme') : 'lagon';
-  const island = ISLANDS.includes(f.get('island')) ? f.get('island') : '';
-  const name = clean(f.get('name'), 60) || t.name;
-  await env.DB.prepare(`UPDATE tenants SET name=?, tagline=?, theme=?, phone=?, whatsapp=?, island=?, bank_details=?, ccp_details=?, osb_link=?, pickup_info=? WHERE id=?`)
-    .bind(name, clean(f.get('tagline'), 140), theme, clean(f.get('phone'), 30), clean(f.get('whatsapp'), 20).replace(/[^0-9]/g, ''),
-      island, clean(f.get('bank_details'), 600), clean(f.get('ccp_details'), 600), osb, clean(f.get('pickup_info'), 600), t.id).run();
-  return redirect('/tableau-de-bord/boutique?ok=' + encodeURIComponent('Boutique enregistrée.'));
-}
-
-// ───────────── Produits ─────────────
-
-function productFields(p = {}) {
-  return `
-    <label for="pname">Nom du produit</label><input id="pname" name="name" required maxlength="80" value="${esc(p.name)}">
-    <div class="row">
-      <div><label for="price">Prix (XPF)</label><input id="price" name="price" type="number" min="0" step="1" required value="${esc(p.price_xpf ?? '')}"></div>
-      <div><label for="stock">Stock</label><input id="stock" name="stock" type="number" min="0" step="1" required value="${esc(p.stock ?? 1)}"></div>
-    </div>
-    <label for="desc">Description</label><textarea id="desc" name="description" maxlength="1200">${esc(p.description)}</textarea>
-    <label for="image">Photo (JPG, PNG ou WebP, 2 Mo max)</label><input id="image" name="image" type="file" accept="image/jpeg,image/png,image/webp">
-    <label style="font-weight:400"><input type="checkbox" name="active" style="width:auto" ${p.active === 0 ? '' : 'checked'}> Visible dans la boutique</label>`;
-}
-
-async function productList(env, url, t) {
-  const plan = getPlan(t.plan);
-  const { results } = await env.DB.prepare('SELECT * FROM products WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC').bind(t.id).all();
-  const full = results.length >= plan.maxProducts;
-  const body = `${flash(url)}
-  <div class="card"><h1>Produits <span class="muted small">${results.length} / ${plan.maxProducts}</span></h1>${meter(results.length, plan.maxProducts)}
-  ${results.length ? `<div class="table-scroll"><table><thead><tr><th>Produit</th><th>Prix</th><th>Stock</th><th>Visible</th><th></th></tr></thead><tbody>
-  ${results.map((p) => `<tr><td>${esc(p.name)}</td><td>${fmtXpf(p.price_xpf)}</td><td>${p.stock}</td><td>${p.active ? 'Oui' : 'Non'}</td>
-    <td><a class="btn small ghost" href="/tableau-de-bord/produits/${p.id}">Modifier</a></td></tr>`).join('')}
-  </tbody></table></div>` : '<p class="muted">Aucun produit pour l’instant.</p>'}</div>
-  <div class="card"><h2>Ajouter un produit</h2>
-  ${full ? `<p>Vous avez atteint la limite de ${plan.maxProducts} produits de la formule ${esc(plan.label)}. <a href="mailto:${esc(env.SUPPORT_EMAIL)}">Passer à la formule supérieure</a>.</p>` :
-    `<form method="post" enctype="multipart/form-data">${productFields()}<button class="btn" type="submit">Ajouter</button></form>`}</div>`;
-  return html(page({ title: 'Produits', body, nav: dashNav('/tableau-de-bord/produits'), brandHref: '/tableau-de-bord' }));
-}
-
-async function storeImage(env, t, file) {
-  if (!file || typeof file === 'string' || !file.size) return { key: null };
+async function storeImage(env, ownerId, file) {
+  if (!file || typeof file === 'string' || !file.size) return { url: null };
   const ext = IMAGE_TYPES[file.type];
-  if (!ext) return { error: 'Format de photo non accepté (JPG, PNG ou WebP).' };
-  if (file.size > MAX_IMAGE_BYTES) return { error: 'Photo trop lourde (2 Mo maximum).' };
-  const key = `${t.id}/${uid()}.${ext}`;
-  await env.IMAGES.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type, cacheControl: 'public, max-age=31536000, immutable' } });
-  return { key };
+  if (!ext) return { error: 'Format d’image non accepté (JPG, PNG ou WebP).' };
+  if (file.size > MAX_IMAGE) return { error: 'Image trop lourde (2 Mo maximum).' };
+  const key = `${ownerId}/${uid()}.${ext}`;
+  await env.IMAGES.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
+  return { url: `/img/${key}` };
 }
-
-function readProduct(f) {
-  return {
-    name: clean(f.get('name'), 80), description: clean(f.get('description'), 1200),
-    price: Math.max(0, int(f.get('price'), -1)), stock: Math.max(0, int(f.get('stock'), 0)),
-    active: f.get('active') ? 1 : 0, rawPrice: int(f.get('price'), -1),
-  };
-}
-
-async function productCreate(request, env, t) {
-  const plan = getPlan(t.plan);
-  const count = (await env.DB.prepare('SELECT COUNT(*) AS n FROM products WHERE tenant_id = ?').bind(t.id).first()).n;
-  if (count >= plan.maxProducts) return redirect('/tableau-de-bord/produits?err=' + encodeURIComponent(`Limite de ${plan.maxProducts} produits atteinte.`));
-  const f = await readForm(request);
-  const p = readProduct(f);
-  if (!p.name || p.rawPrice < 0) return redirect('/tableau-de-bord/produits?err=' + encodeURIComponent('Nom et prix obligatoires.'));
-  const img = await storeImage(env, t, f.get('image'));
-  if (img.error) return redirect('/tableau-de-bord/produits?err=' + encodeURIComponent(img.error));
-  await env.DB.prepare('INSERT INTO products (id, tenant_id, name, description, price_xpf, stock, image_key, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(uid('p_'), t.id, p.name, p.description, p.price, p.stock, img.key || '', p.active).run();
-  return redirect('/tableau-de-bord/produits?ok=' + encodeURIComponent('Produit ajouté.'));
-}
-
-async function productEditForm(env, url, t, id) {
-  const p = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!p) return notFound();
-  const body = `${flash(url)}<div class="card"><h1>Modifier le produit</h1>
-    ${p.image_key ? `<img src="/img/${esc(p.image_key)}" alt="" style="max-width:220px;border-radius:12px;margin-bottom:8px">` : ''}
-    <form method="post" enctype="multipart/form-data">${productFields(p)}<button class="btn" type="submit">Enregistrer</button></form>
-    <form method="post" action="/tableau-de-bord/produits/${p.id}/supprimer" onsubmit="return confirm('Supprimer ce produit ?')" class="noprint">
-      <button class="btn danger small" type="submit" style="margin-top:22px">Supprimer le produit</button></form></div>`;
-  return html(page({ title: 'Modifier le produit', body, nav: dashNav('/tableau-de-bord/produits'), brandHref: '/tableau-de-bord' }));
-}
-
-async function productUpdate(request, env, t, id) {
-  const existing = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!existing) return notFound();
-  const f = await readForm(request);
-  const p = readProduct(f);
-  if (!p.name || p.rawPrice < 0) return redirect(`/tableau-de-bord/produits/${id}?err=` + encodeURIComponent('Nom et prix obligatoires.'));
-  const img = await storeImage(env, t, f.get('image'));
-  if (img.error) return redirect(`/tableau-de-bord/produits/${id}?err=` + encodeURIComponent(img.error));
-  if (img.key && existing.image_key) await env.IMAGES.delete(existing.image_key);
-  await env.DB.prepare('UPDATE products SET name=?, description=?, price_xpf=?, stock=?, active=?, image_key=? WHERE id=? AND tenant_id=?')
-    .bind(p.name, p.description, p.price, p.stock, p.active, img.key || existing.image_key, id, t.id).run();
-  return redirect('/tableau-de-bord/produits?ok=' + encodeURIComponent('Produit enregistré.'));
-}
-
-async function productDelete(env, t, id) {
-  const p = await env.DB.prepare('SELECT image_key FROM products WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!p) return notFound();
-  if (p.image_key) await env.IMAGES.delete(p.image_key);
-  await env.DB.prepare('DELETE FROM products WHERE id = ? AND tenant_id = ?').bind(id, t.id).run();
-  return redirect('/tableau-de-bord/produits?ok=' + encodeURIComponent('Produit supprimé.'));
-}
-
-// ───────────── Commandes ─────────────
-
-async function orderList(env, url, t) {
-  const filter = ORDER_STATUSES[url.searchParams.get('statut')] ? url.searchParams.get('statut') : '';
-  const q = filter
-    ? env.DB.prepare('SELECT * FROM orders WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT 200').bind(t.id, filter)
-    : env.DB.prepare('SELECT * FROM orders WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200').bind(t.id);
-  const { results } = await q.all();
-  const tabs = [['', 'Toutes'], ...Object.entries(ORDER_STATUSES)].map(([k, v]) =>
-    `<a class="btn small ${k === filter ? '' : 'ghost'}" href="/tableau-de-bord/commandes${k ? '?statut=' + k : ''}">${v}</a>`).join(' ');
-  const body = `${flash(url)}<div class="card"><h1>Commandes</h1><div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:12px">${tabs}</div>
-  ${results.length ? `<div class="table-scroll"><table><thead><tr><th>N°</th><th>Date</th><th>Client</th><th>Total</th><th>Paiement</th><th>Statut</th><th></th></tr></thead><tbody>
-  ${results.map((o) => `<tr><td>${esc(o.number)}${o.over_quota ? ' <span class="badge suspendu">hors quota</span>' : ''}</td><td>${fmtDate(o.created_at)}</td>
-    <td>${esc(o.customer_name)}<br><span class="muted small">${esc(o.island)} · ${esc(o.customer_phone)}</span></td>
-    <td>${fmtXpf(o.total_xpf)}</td><td class="small">${esc(PAYMENT_METHODS[o.payment_method] || o.payment_method)}</td>
-    <td><span class="badge ${esc(o.status)}">${esc(ORDER_STATUSES[o.status] || o.status)}</span></td>
-    <td><a class="btn small ghost" href="/tableau-de-bord/commandes/${o.id}">Ouvrir</a></td></tr>`).join('')}
-  </tbody></table></div>` : '<p class="muted">Aucune commande.</p>'}</div>`;
-  return html(page({ title: 'Commandes', body, nav: dashNav('/tableau-de-bord/commandes'), brandHref: '/tableau-de-bord' }));
-}
-
-async function orderSlip(env, t, id) {
-  const o = await env.DB.prepare('SELECT * FROM orders WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!o) return notFound();
-  const items = JSON.parse(o.items_json);
-  const statusForm = `<form method="post" action="/tableau-de-bord/commandes/${o.id}/statut" class="row noprint" style="align-items:end">
-      <div><label for="status">Statut</label><select id="status" name="status">${Object.entries(ORDER_STATUSES).map(([k, v]) => `<option value="${k}" ${k === o.status ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
-      <div><button class="btn" type="submit">Mettre à jour</button> <button class="btn ghost" type="button" onclick="window.print()">Imprimer bon + étiquette</button></div>
-    </form>`;
-  const body = `<div class="card noprint"><a href="/tableau-de-bord/commandes">← Commandes</a>${statusForm}</div>
-  <div class="card">
-    <h1>Bon de commande ${esc(o.number)}</h1>
-    <p class="muted">${esc(t.name)} · ${fmtDate(o.created_at)} · ${esc(PAYMENT_METHODS[o.payment_method] || '')} · <span class="badge ${esc(o.status)}">${esc(ORDER_STATUSES[o.status])}</span></p>
-    <table><thead><tr><th>Article</th><th>Qté</th><th>Prix</th><th>Sous-total</th></tr></thead><tbody>
-    ${items.map((i) => `<tr><td>${esc(i.name)}</td><td>${i.qty}</td><td>${fmtXpf(i.price)}</td><td>${fmtXpf(i.price * i.qty)}</td></tr>`).join('')}
-    <tr><td colspan="3"><b>Total</b></td><td><b>${fmtXpf(o.total_xpf)}</b></td></tr></tbody></table>
-    ${o.note ? `<p><b>Note du client :</b> ${esc(o.note)}</p>` : ''}
-  </div>
-  <div class="card" style="border:2px dashed var(--ink);max-width:420px">
-    <p class="small muted" style="margin:0">EXPÉDITEUR : ${esc(t.name)}${t.island ? ' — ' + esc(t.island) : ''}${t.phone ? ' — ' + esc(t.phone) : ''}</p>
-    <h2 style="margin:14px 0 6px">${esc(o.customer_name)}</h2>
-    <p style="margin:0;white-space:pre-line;font-size:1.1rem">${esc(o.address)}</p>
-    <p style="margin:6px 0 0;font-size:1.2rem;font-weight:700">${esc(o.island)} — Polynésie française</p>
-    <p class="small" style="margin:8px 0 0">Tél. ${esc(o.customer_phone)} · Réf. ${esc(o.number)}</p>
-  </div>`;
-  return html(page({ title: `Commande ${o.number}`, body, nav: dashNav('/tableau-de-bord/commandes'), brandHref: '/tableau-de-bord' }));
-}
-
-async function orderStatus(request, env, t, id) {
-  const f = await readForm(request);
-  const status = String(f.get('status') || '');
-  if (!ORDER_STATUSES[status]) return redirect(`/tableau-de-bord/commandes/${id}`);
-  const o = await env.DB.prepare('SELECT * FROM orders WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!o) return notFound();
-  const stmts = [env.DB.prepare('UPDATE orders SET status = ? WHERE id = ? AND tenant_id = ?').bind(status, id, t.id)];
-  const items = JSON.parse(o.items_json);
-  // Annulation : on remet le stock ; réactivation d'une commande annulée : on le reprend
-  if (status === 'annulee' && o.status !== 'annulee') {
-    for (const i of items) stmts.push(env.DB.prepare('UPDATE products SET stock = stock + ? WHERE id = ? AND tenant_id = ?').bind(i.qty, i.id, t.id));
-  } else if (o.status === 'annulee' && status !== 'annulee') {
-    for (const i of items) stmts.push(env.DB.prepare('UPDATE products SET stock = MAX(0, stock - ?) WHERE id = ? AND tenant_id = ?').bind(i.qty, i.id, t.id));
-  }
-  await env.DB.batch(stmts);
-  return redirect(`/tableau-de-bord/commandes/${id}?ok=` + encodeURIComponent('Statut mis à jour.'));
-}
-
-// ───────────────────────────── Vitrine publique ─────────────────────────────
-
-async function storefront(request, env, url, slug, sub, base) {
-  const t = await env.DB.prepare('SELECT * FROM tenants WHERE slug = ?').bind(slug).first();
-  if (!t) return notFound();
-  if (isOffline(t, env)) {
-    return html(page({ title: 'Boutique indisponible', theme: t.theme, brand: t.name, brandHref: base || '/',
-      body: '<div class="card"><h1>Boutique momentanément indisponible</h1><p class="muted">Revenez bientôt.</p></div>' }), 503, { 'cache-control': 'no-store' });
-  }
-  if (sub === '/' && request.method === 'GET') return shopHome(env, url, t, base);
-  if (sub === '/commander' && request.method === 'POST') return placeOrder(request, env, t, base);
-  const m = sub.match(/^\/commande\/([a-z0-9_]+)$/);
-  if (m && request.method === 'GET') return orderConfirmation(env, t, m[1], base);
-  return notFound();
-}
-
-async function shopHome(env, url, t, base) {
-  const { results } = await env.DB.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY created_at DESC, rowid DESC').bind(t.id).all();
-  const methods = paymentMethodsOf(t);
-  const canOrder = methods.length > 0 && results.some((p) => p.stock > 0);
-  const products = results.map((p) => `
-    <article class="product">
-      <div class="ph">${p.image_key ? `<img src="/img/${esc(p.image_key)}" alt="${esc(p.name)}" loading="lazy">` : 'Photo à venir'}</div>
-      <div class="body">
-        <h3 style="margin:0">${esc(p.name)}</h3>
-        ${p.description ? `<p class="muted small" style="margin:0;white-space:pre-line">${esc(p.description)}</p>` : ''}
-        <div class="price">${fmtXpf(p.price_xpf)}</div>
-        ${p.stock > 0 && methods.length
-          ? `<div class="qty"><label for="q_${p.id}" style="margin:0">Quantité</label><input form="order" id="q_${p.id}" name="q_${p.id}" type="number" min="0" max="${p.stock}" value="0"></div>`
-          : `<span class="badge suspendu">${p.stock > 0 ? 'Sur demande' : 'Épuisé'}</span>`}
-      </div>
-    </article>`).join('');
-  const wa = t.whatsapp ? `<a class="btn ghost small" href="https://wa.me/${esc(t.whatsapp)}" target="_blank" rel="noopener">WhatsApp</a>` : '';
-  const body = `${flash(url)}
-  <section class="hero" style="padding-top:8px"><h1>${esc(t.name)}</h1>${t.tagline ? `<p>${esc(t.tagline)}</p>` : ''}
-    <p class="small muted">${t.island ? esc(t.island) + ' · ' : ''}${t.phone ? esc(t.phone) : ''} ${wa}</p></section>
-  ${results.length ? `<div class="grid">${products}</div>` : '<div class="card"><p class="muted">Les produits arrivent bientôt.</p></div>'}
-  ${canOrder ? `
-  <div class="card" style="margin-top:24px"><h2>Passer commande</h2>
-    <p class="muted small">Choisissez les quantités ci-dessus, puis remplissez vos coordonnées. Vous recevrez les instructions de paiement à l’écran.</p>
-    <form id="order" method="post" action="${base}/commander">
-      <div class="row">
-        <div><label for="cn">Nom complet</label><input id="cn" name="customer_name" required maxlength="80"></div>
-        <div><label for="cp">Téléphone</label><input id="cp" name="customer_phone" required maxlength="30"></div>
-        <div><label for="ce">E-mail (facultatif)</label><input id="ce" name="customer_email" type="email" maxlength="120"></div>
-      </div>
-      <div class="row">
-        <div><label for="ad">Adresse de livraison (BP, quartier, PK…)</label><textarea id="ad" name="address" required maxlength="400"></textarea></div>
-        <div><label for="is">Île</label><select id="is" name="island" required><option value=""></option>${ISLANDS.map((i) => `<option>${i}</option>`).join('')}</select>
-          <label for="pm">Paiement</label><select id="pm" name="payment_method" required>${methods.map((m) => `<option value="${m}">${esc(PAYMENT_METHODS[m])}</option>`).join('')}</select></div>
-      </div>
-      <label for="nt">Note (facultatif)</label><input id="nt" name="note" maxlength="300">
-      <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
-      <button class="btn" type="submit">Valider ma commande</button>
-    </form>
-    ${t.pickup_info ? `<p class="small muted" style="white-space:pre-line">${esc(t.pickup_info)}</p>` : ''}
-  </div>` : ''}`;
-  return html(page({ title: t.name, body, theme: t.theme, brand: t.name, brandHref: base || '/', description: t.tagline || `Boutique ${t.name}` }));
-}
-
-async function placeOrder(request, env, t, base) {
-  const back = (msg) => redirect(`${base || ''}/?err=` + encodeURIComponent(msg));
-  const f = await readForm(request);
-  if (f.get('website')) return back('Commande refusée.'); // pot de miel anti-robots
-  const methods = paymentMethodsOf(t);
-  const payment = String(f.get('payment_method') || '');
-  if (!methods.includes(payment)) return back('Choisissez un moyen de paiement.');
-  const customer = {
-    name: clean(f.get('customer_name'), 80), phone: clean(f.get('customer_phone'), 30),
-    email: clean(f.get('customer_email'), 120), address: clean(f.get('address'), 400),
-    island: ISLANDS.includes(f.get('island')) ? f.get('island') : '', note: clean(f.get('note'), 300),
-  };
-  if (!customer.name || !customer.phone || !customer.address || !customer.island) return back('Merci de remplir nom, téléphone, adresse et île.');
-
-  const wanted = [];
-  for (const [k, v] of f.entries()) {
-    if (k.startsWith('q_')) { const q = int(v, 0); if (q > 0) wanted.push({ id: k.slice(2), qty: Math.min(q, 999) }); }
-  }
-  if (!wanted.length) return back('Choisissez au moins un produit (quantité).');
-
-  const { results: products } = await env.DB.prepare(`SELECT id, name, price_xpf, stock FROM products WHERE tenant_id = ? AND active = 1 AND id IN (${wanted.map(() => '?').join(',')})`)
-    .bind(t.id, ...wanted.map((w) => w.id)).all();
-  const byId = Object.fromEntries(products.map((p) => [p.id, p]));
-  const items = [];
-  for (const w of wanted) {
-    const p = byId[w.id];
-    if (!p) return back('Un produit n’est plus disponible.');
-    if (p.stock < w.qty) return back(`Stock insuffisant pour « ${p.name} » (reste ${p.stock}).`);
-    items.push({ id: p.id, name: p.name, qty: w.qty, price: p.price_xpf });
-  }
-
-  // Réservation du stock de façon atomique produit par produit ; on annule en cas d'échec concurrent
-  const reserved = [];
-  for (const i of items) {
-    const r = await env.DB.prepare('UPDATE products SET stock = stock - ? WHERE id = ? AND tenant_id = ? AND stock >= ?').bind(i.qty, i.id, t.id, i.qty).run();
-    if (!r.meta.changes) {
-      if (reserved.length) await env.DB.batch(reserved.map((x) => env.DB.prepare('UPDATE products SET stock = stock + ? WHERE id = ? AND tenant_id = ?').bind(x.qty, x.id, t.id)));
-      return back(`« ${i.name} » vient d’être épuisé.`);
-    }
-    reserved.push(i);
-  }
-
-  const plan = getPlan(t.plan);
-  const total = items.reduce((s, i) => s + i.price * i.qty, 0);
-  const monthSales = (await env.DB.prepare(`SELECT COUNT(*) AS n FROM orders WHERE tenant_id = ? AND status != 'annulee' AND created_at >= ?`).bind(t.id, monthStartSql()).first()).n;
-  const overQuota = monthSales >= plan.salesQuota ? 1 : 0;
-  const id = uid('o_');
-  const tahiti = new Date(Date.now() - 10 * 3600000);
-  const prefix = `CMD-${String(tahiti.getUTCFullYear()).slice(2)}${String(tahiti.getUTCMonth() + 1).padStart(2, '0')}-`;
-
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const n = (await env.DB.prepare('SELECT COUNT(*) AS n FROM orders WHERE tenant_id = ? AND number LIKE ?').bind(t.id, prefix + '%').first()).n + 1 + attempt;
-    const number = prefix + String(n).padStart(4, '0');
-    try {
-      await env.DB.prepare(`INSERT INTO orders (id, tenant_id, number, customer_name, customer_email, customer_phone, address, island, note, items_json, total_xpf, payment_method, over_quota)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .bind(id, t.id, number, customer.name, customer.email, customer.phone, customer.address, customer.island, customer.note,
-          JSON.stringify(items), total, payment, overQuota).run();
-      return redirect(`${base}/commande/${id}`);
-    } catch (e) {
-      if (!String(e).includes('UNIQUE')) {
-        await env.DB.batch(reserved.map((x) => env.DB.prepare('UPDATE products SET stock = stock + ? WHERE id = ? AND tenant_id = ?').bind(x.qty, x.id, t.id)));
-        throw e;
-      }
-    }
-  }
-  await env.DB.batch(reserved.map((x) => env.DB.prepare('UPDATE products SET stock = stock + ? WHERE id = ? AND tenant_id = ?').bind(x.qty, x.id, t.id)));
-  return back('Merci de réessayer dans un instant.');
-}
-
-async function orderConfirmation(env, t, id, base) {
-  const o = await env.DB.prepare('SELECT * FROM orders WHERE id = ? AND tenant_id = ?').bind(id, t.id).first();
-  if (!o) return notFound();
-  const items = JSON.parse(o.items_json);
-  let pay = '';
-  if (o.payment_method === 'virement') pay = `<p>Effectuez un virement de <b>${fmtXpf(o.total_xpf)}</b> avec la référence <b>${esc(o.number)}</b> :</p><pre style="white-space:pre-wrap;background:var(--bg);padding:12px;border-radius:10px">${esc(t.bank_details)}</pre>`;
-  if (o.payment_method === 'ccp') pay = `<p>Réglez <b>${fmtXpf(o.total_xpf)}</b> en espèces au guichet en indiquant la référence <b>${esc(o.number)}</b> :</p><pre style="white-space:pre-wrap;background:var(--bg);padding:12px;border-radius:10px">${esc(t.ccp_details)}</pre>`;
-  if (o.payment_method === 'carte') pay = `<p>Réglez <b>${fmtXpf(o.total_xpf)}</b> par carte sur la page sécurisée de la banque. Indiquez la référence <b>${esc(o.number)}</b>.</p><a class="btn" href="${esc(t.osb_link)}" target="_blank" rel="noopener">Payer par carte</a>`;
-  const waText = encodeURIComponent(`Bonjour, je viens de passer la commande ${o.number} (${fmtXpf(o.total_xpf)}).`);
-  const body = `<div class="card"><h1>Merci, commande enregistrée</h1>
-    <p>Référence : <b>${esc(o.number)}</b> — notez-la.</p>
-    <ul>${items.map((i) => `<li>${i.qty} × ${esc(i.name)} — ${fmtXpf(i.price * i.qty)}</li>`).join('')}</ul>
-    <p><b>Total : ${fmtXpf(o.total_xpf)}</b></p></div>
-    <div class="card"><h2>Paiement</h2>${pay}
-    <p class="small muted">La commande est préparée dès réception du paiement par ${esc(t.name)}.</p>
-    ${t.whatsapp ? `<a class="btn ghost" href="https://wa.me/${esc(t.whatsapp)}?text=${waText}" target="_blank" rel="noopener">Prévenir la boutique sur WhatsApp</a>` : ''}
-    <p><a href="${base || '/'}">← Retour à la boutique</a></p></div>`;
-  return html(page({ title: `Commande ${o.number}`, body, theme: t.theme, brand: t.name, brandHref: base || '/' }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
+async function dropImage(env, url) {
+  if (url && url.startsWith('/img/')) await env.IMAGES.delete(url.slice(5));
 }
 
 async function serveImage(url, env) {
   const key = decodeURIComponent(url.pathname.replace(/^\/img\//, ''));
-  if (!/^t_[a-f0-9]+\/[a-f0-9]+\.(jpg|png|webp)$/.test(key)) return new Response('Introuvable', { status: 404 });
+  if (!/^[a-f0-9]{32}\/[a-f0-9]{32}\.(jpg|png|webp)$/.test(key)) return new Response('Introuvable', { status: 404 });
   const obj = await env.IMAGES.get(key);
   if (!obj) return new Response('Introuvable', { status: 404 });
-  const headers = new Headers();
-  obj.writeHttpMetadata(headers);
-  headers.set('etag', obj.httpEtag);
-  headers.set('cache-control', 'public, max-age=31536000, immutable');
-  headers.set('x-content-type-options', 'nosniff');
-  return new Response(obj.body, { headers });
+  const h = new Headers();
+  obj.writeHttpMetadata(h);
+  h.set('etag', obj.httpEtag);
+  h.set('cache-control', 'public, max-age=31536000, immutable');
+  h.set('x-content-type-options', 'nosniff');
+  return new Response(obj.body, { headers: h });
+}
+
+// ───────────────────────────── Tableau de bord commerçant ─────────────────────────────
+
+function dash(title, active, body, extraHead = '') {
+  return html(appPage({ title, body, nav: dashNav(active), brandHref: '/tableau-de-bord', extraHead }), 200, { 'cache-control': 'no-store' });
+}
+
+async function dashboard(request, env, url, b, who, sub) {
+  const post = request.method === 'POST';
+  const [section, id, action] = sub;
+  if (!section) return dashHome(env, url, b);
+  if (section === 'parametres') return post ? settingsPost(request, env, b) : settingsForm(url, b);
+  if (section === 'apparence') return post ? appearancePost(request, env, b) : appearanceForm(env, url, b);
+  if (section === 'osb') return post ? osbPost(request, env, b, who) : osbForm(env, url, b, who);
+  if (section === 'produits') {
+    if (!id) return post ? productSave(request, env, b, null) : productList(env, url, b);
+    if (action === 'supprimer' && post) return productDelete(env, b, id);
+    return post ? productSave(request, env, b, id) : productEdit(env, url, b, id);
+  }
+  if (section === 'commandes') {
+    if (!id) return orderList(env, url, b);
+    if (action === 'avancer' && post) return orderAdvance(env, b, id);
+    if (action === 'supprimer' && post) return orderDelete(env, b, id);
+    return orderDetail(env, url, b, id);
+  }
+  return notFound();
+}
+
+async function dashHome(env, url, b) {
+  const plan = getPlan(b.plan);
+  const u = await usage(env, b);
+  const link = storeUrl(env, b, url.origin);
+  const offline = isOffline(b, env);
+  const payLink = env['PAY_LINK_' + b.plan.toUpperCase()];
+  const steps = [
+    [methodsOf(b).length > 0, 'Indiquez au moins un moyen de paiement', '/tableau-de-bord/parametres'],
+    [u.offres > 0, 'Ajoutez votre premier produit', '/tableau-de-bord/produits'],
+    [!!(b.telephone || b.whatsapp), 'Ajoutez un numéro de contact', '/tableau-de-bord/parametres'],
+    [!!(b.logo_url || b.slogan), 'Personnalisez votre vitrine (logo, accroche, sections)', '/tableau-de-bord/apparence'],
+  ].filter((s) => !s[0]);
+  const surplus = Math.max(0, u.ventes - plan.salesQuota);
+  const body = `${flash(url)}
+  ${offline ? '<div class="flash err"><b>Votre boutique est hors ligne</b> : l’abonnement n’est pas à jour. Réglez-le pour la remettre en ligne aussitôt.</div>' : ''}
+  <div class="card">
+    <h1>${esc(b.nom)}</h1>
+    <p>Votre boutique : <a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a></p>
+    <p><span class="badge ${esc(b.statut)}">${b.statut === 'active' ? 'En ligne' : 'Suspendue'}</span>
+      <span class="small muted">· ${esc(plan.label)} · ${b.cycle} · réglée jusqu’au ${fmtDate(b.date_echeance)}</span></p>
+  </div>
+  ${steps.length ? `<div class="card"><h2>Pour ouvrir votre boutique</h2><ol>${steps.map((s) => `<li><a href="${s[2]}">${s[1]}</a></li>`).join('')}</ol></div>` : ''}
+  <div class="stats">
+    <div class="stat"><b>${u.offres} / ${plan.maxProducts}</b><span>produits</span>${meter(u.offres, plan.maxProducts)}</div>
+    <div class="stat"><b>${u.ventes} / ${plan.salesQuota}</b><span>ventes payées ce mois</span>${meter(u.ventes, plan.salesQuota)}</div>
+    <div class="stat"><b>${fmtXpf(u.ca)}</b><span>encaissé ce mois</span></div>
+    <div class="stat"><b>${u.attente} · ${u.a_expedier}</b><span>en attente · à expédier</span></div>
+  </div>
+  ${surplus ? `<div class="flash err">${surplus} vente(s) au-delà du quota de votre formule ce mois-ci : elles seront facturées en supplément, ou passez à la formule supérieure.</div>` : ''}
+  <div class="card"><h2>Mon abonnement</h2>
+    <p>${esc(plan.label)} : <b>${fmtXpf(plan.monthly)}</b> / mois, ou <b>${fmtXpf(annualPrice(plan))}</b> / an.</p>
+    ${payLink ? `<a class="btn" href="${esc(payLink)}" target="_blank" rel="noopener">Régler mon abonnement</a>` : `<p class="muted">Pour régler votre abonnement, écrivez à <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a>.</p>`}
+  </div>`;
+  return dash('Tableau de bord', '/tableau-de-bord', body);
+}
+
+// ───────────── Paramètres ─────────────
+
+function settingsForm(url, b) {
+  const v = (k) => esc(b[k] || '');
+  const body = `${flash(url)}<div class="card"><h1>Paramètres</h1><form method="post">
+    <div class="row">
+      <div><label for="nom">Nom de la boutique</label><input id="nom" name="nom" required maxlength="60" value="${v('nom')}"></div>
+      <div><label for="slogan">Phrase d’accroche</label><input id="slogan" name="slogan" maxlength="140" value="${v('slogan')}"></div>
+    </div>
+    <div class="row">
+      <div><label for="tel">Téléphone</label><input id="tel" name="telephone" maxlength="30" value="${v('telephone')}"></div>
+      <div><label for="wa">WhatsApp (ex. 68989123456)</label><input id="wa" name="whatsapp" maxlength="20" inputmode="numeric" value="${v('whatsapp')}"></div>
+      <div><label for="ile">Île</label><select id="ile" name="ile"><option value=""></option>${ISLANDS.map((i) => `<option ${i === b.ile ? 'selected' : ''}>${i}</option>`).join('')}</select></div>
+    </div>
+    <h2 style="margin-top:24px">Moyens de paiement</h2>
+    <p class="muted small">L’argent des ventes va directement sur votre compte. Remplissez au moins un moyen.</p>
+    <label for="rib">Virement : vos coordonnées bancaires (titulaire, banque, IBAN)</label><textarea id="rib" name="rib" maxlength="600">${v('rib')}</textarea>
+    <label for="ccp">Espèces au guichet (CCP / Marara Paiement) : vos consignes</label><textarea id="ccp" name="consignes_ccp" maxlength="600">${v('consignes_ccp')}</textarea>
+    <label for="carte">Carte bancaire : lien de paiement OSB / PayZen (https://…)</label><input id="carte" name="lien_paiement_carte" maxlength="500" value="${v('lien_paiement_carte')}">
+    <p class="small muted">Pas encore de lien carte ? <a href="/tableau-de-bord/osb">Faire la demande à OSB</a>.</p>
+    <label for="bq">Votre banque</label><select id="bq" name="banque"><option value=""></option>${BANQUES.map((x) => `<option ${x === b.banque ? 'selected' : ''}>${x}</option>`).join('')}</select>
+    <label for="liv">Livraison et retrait</label><textarea id="liv" name="infos_livraison" maxlength="600">${v('infos_livraison')}</textarea>
+    <h2 style="margin-top:24px">Factures</h2>
+    <div class="row">
+      <div><label for="nt">N° Tahiti</label><input id="nt" name="numero_tahiti" maxlength="20" value="${v('numero_tahiti')}"></div>
+    </div>
+    <label for="mf">Mentions en bas de facture (statut, RCS, TVA…)</label><textarea id="mf" name="mentions_facture" maxlength="600">${v('mentions_facture')}</textarea>
+    <button class="btn" type="submit">Enregistrer</button></form></div>`;
+  return dash('Paramètres', '/tableau-de-bord/parametres', body);
+}
+
+async function settingsPost(request, env, b) {
+  const f = await readForm(request);
+  const carte = clean(f.get('lien_paiement_carte'), 500);
+  if (carte && !isHttps(carte)) return redirect(withMsg('/tableau-de-bord/parametres', 'err', 'Le lien de paiement carte doit commencer par https://'));
+  await env.DB.prepare(`UPDATE boutiques SET nom=?, slogan=?, telephone=?, whatsapp=?, ile=?, rib=?, consignes_ccp=?, lien_paiement_carte=?,
+      banque=?, infos_livraison=?, numero_tahiti=?, mentions_facture=? WHERE id=?`)
+    .bind(clean(f.get('nom'), 60) || b.nom, clean(f.get('slogan'), 140), clean(f.get('telephone'), 30), clean(f.get('whatsapp'), 20).replace(/\D/g, ''),
+      ISLANDS.includes(f.get('ile')) ? f.get('ile') : null, clean(f.get('rib'), 600), clean(f.get('consignes_ccp'), 600), carte,
+      BANQUES.includes(f.get('banque')) ? f.get('banque') : null, clean(f.get('infos_livraison'), 600), clean(f.get('numero_tahiti'), 20),
+      clean(f.get('mentions_facture'), 600), b.id).run();
+  return redirect(withMsg('/tableau-de-bord/parametres', 'ok', 'Paramètres enregistrés.'));
+}
+
+// ───────────── Apparence : modèle, couleurs, logo, sections ─────────────
+
+function appearanceForm(env, url, b) {
+  const sections = parseSections(b.sections_json, b);
+  const c = storeColors(b);
+  const body = `${flash(url)}<form method="post" enctype="multipart/form-data">
+    <div class="card"><h1>Apparence</h1>
+      <p><a href="${esc(storeUrl(env, b, url.origin))}" target="_blank" rel="noopener">Voir ma boutique ↗</a></p>
+      <label>Modèle</label>
+      <div class="modeles">${Object.entries(MODELES).map(([k, m]) => `<label><input type="radio" name="modele" value="${k}" ${k === b.modele ? 'checked' : ''}> ${m.label}
+        <div class="small muted">${esc(m.pitch)}</div></label>`).join('')}</div>
+      <div class="row">
+        <div><label for="cp">Couleur principale</label><input id="cp" type="color" name="couleur_principale" value="${esc(c.primary)}"></div>
+        <div><label for="cs">Couleur secondaire</label><input id="cs" type="color" name="couleur_secondaire" value="${esc(c.secondary)}"></div>
+      </div>
+      <label for="logo">Logo (PNG, JPG ou WebP, 2 Mo max)</label>
+      ${b.logo_url ? `<img src="${esc(b.logo_url)}" alt="Logo actuel" style="height:56px;width:auto;margin:6px 0"><label style="font-weight:400"><input type="checkbox" name="retirer_logo"> Retirer le logo</label>` : ''}
+      <input id="logo" name="logo" type="file" accept="image/png,image/jpeg,image/webp">
+    </div>
+    <div class="card"><h2>Sections de la vitrine</h2>
+      <p class="muted small">Ordonnez, masquez et modifiez les blocs de votre page. La section « Produits et commande » est obligatoire.</p>
+      <noscript><p class="flash err">Activez JavaScript pour modifier les sections.</p></noscript>
+      <div id="editeur"></div>
+      <input type="hidden" name="sections_json" value="${esc(JSON.stringify(sections))}">
+      <script type="application/json" id="sections-data">${jsonForScript(sections)}</script>
+      <script type="application/json" id="section-types">${jsonForScript(SECTION_TYPES)}</script>
+    </div>
+    <button class="btn" type="submit">Enregistrer l’apparence</button>
+  </form><script src="/static/editeur.js" defer></script>`;
+  return dash('Apparence', '/tableau-de-bord/apparence', body, `<style>${EDITOR_CSS}</style>`);
+}
+
+async function appearancePost(request, env, b) {
+  const f = await readForm(request);
+  const modele = MODELES[f.get('modele')] ? f.get('modele') : b.modele;
+  const cp = isColor(f.get('couleur_principale')) ? f.get('couleur_principale') : b.couleur_principale;
+  const cs = isColor(f.get('couleur_secondaire')) ? f.get('couleur_secondaire') : b.couleur_secondaire;
+  const sections = sanitizeSections(String(f.get('sections_json') || ''));
+  let logo = b.logo_url;
+  const up = await storeImage(env, b.id, f.get('logo'));
+  if (up.error) return redirect(withMsg('/tableau-de-bord/apparence', 'err', up.error));
+  if (up.url || f.get('retirer_logo')) { await dropImage(env, b.logo_url); logo = up.url || null; }
+  await env.DB.prepare('UPDATE boutiques SET modele=?, couleur_principale=?, couleur_secondaire=?, logo_url=?, sections_json=? WHERE id=?')
+    .bind(modele, cp, cs, logo, JSON.stringify(sections), b.id).run();
+  return redirect(withMsg('/tableau-de-bord/apparence', 'ok', 'Apparence enregistrée.'));
+}
+
+// ───────────── Produits (table offres) ─────────────
+
+function productFields(o = {}) {
+  return `<label for="nom">Nom du produit</label><input id="nom" name="nom" required maxlength="80" value="${esc(o.nom)}">
+    <div class="row">
+      <div><label for="prix">Prix (XPF)</label><input id="prix" name="prix_xpf" type="number" min="0" step="1" required inputmode="numeric" value="${esc(o.prix_xpf ?? '')}"></div>
+      <div><label for="stock">Stock</label><input id="stock" name="stock" type="number" min="0" step="1" required inputmode="numeric" value="${esc(o.stock ?? 1)}"></div>
+      <div><label for="ordre">Position (1 = en premier)</label><input id="ordre" name="ordre" type="number" min="0" step="1" value="${esc(o.ordre ?? 0)}"></div>
+    </div>
+    <label for="desc">Description</label><textarea id="desc" name="description" maxlength="1200">${esc(o.description)}</textarea>
+    <label for="img">Photo (JPG, PNG ou WebP, 2 Mo max)</label><input id="img" name="image" type="file" accept="image/jpeg,image/png,image/webp">`;
+}
+
+async function productList(env, url, b) {
+  const plan = getPlan(b.plan);
+  const { results } = await env.DB.prepare('SELECT * FROM offres WHERE boutique_id = ? ORDER BY ordre, rowid').bind(b.id).all();
+  const full = results.length >= plan.maxProducts;
+  const body = `${flash(url)}<div class="card"><h1>Produits <span class="muted small">${results.length} / ${plan.maxProducts}</span></h1>${meter(results.length, plan.maxProducts)}
+    ${results.length ? `<div class="table-scroll"><table><thead><tr><th>Produit</th><th>Prix</th><th>Stock</th><th></th></tr></thead><tbody>
+    ${results.map((o) => `<tr><td>${esc(o.nom)}</td><td>${fmtXpf(o.prix_xpf)}</td><td>${o.stock}</td><td><a class="btn small ghost" href="/tableau-de-bord/produits/${o.id}">Modifier</a></td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="muted">Aucun produit pour l’instant.</p>'}</div>
+  <div class="card"><h2>Ajouter un produit</h2>
+    ${full ? `<p>Limite de ${plan.maxProducts} produits atteinte pour la formule ${esc(plan.label)}. <a href="mailto:${esc(env.SUPPORT_EMAIL)}">Passer à la formule supérieure</a>.</p>`
+      : `<form method="post" enctype="multipart/form-data">${productFields({ ordre: results.length + 1 })}<button class="btn" type="submit">Ajouter</button></form>`}</div>`;
+  return dash('Produits', '/tableau-de-bord/produits', body);
+}
+
+async function productEdit(env, url, b, id) {
+  const o = await env.DB.prepare('SELECT * FROM offres WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+  if (!o) return notFound();
+  const c = storeColors(b);
+  const visual = o.image_url ? `<img src="${esc(o.image_url)}" alt="">` : illu('vague', c.primary, c.secondary);
+  const body = `${flash(url)}<div class="card"><p><a href="/tableau-de-bord/produits">← Produits</a></p><h1>Modifier le produit</h1>
+    <div style="width:160px;border-radius:12px;overflow:hidden;margin-bottom:8px">${visual}</div>
+    <form method="post" enctype="multipart/form-data">${productFields(o)}<button class="btn" type="submit">Enregistrer</button></form>
+    <form method="post" action="/tableau-de-bord/produits/${esc(o.id)}/supprimer" onsubmit="return confirm('Supprimer ce produit ?')">
+      <button class="btn danger small" type="submit" style="margin-top:22px">Supprimer le produit</button></form></div>`;
+  return dash('Modifier le produit', '/tableau-de-bord/produits', body);
+}
+
+async function productSave(request, env, b, id) {
+  const back = id ? `/tableau-de-bord/produits/${id}` : '/tableau-de-bord/produits';
+  let existing = null;
+  if (id) {
+    existing = await env.DB.prepare('SELECT * FROM offres WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+    if (!existing) return notFound();
+  } else {
+    const plan = getPlan(b.plan);
+    const n = (await env.DB.prepare('SELECT COUNT(*) AS n FROM offres WHERE boutique_id = ?').bind(b.id).first()).n;
+    if (n >= plan.maxProducts) return redirect(withMsg(back, 'err', `Limite de ${plan.maxProducts} produits atteinte.`));
+  }
+  const f = await readForm(request);
+  const nom = clean(f.get('nom'), 80);
+  const prix = int(f.get('prix_xpf'), -1);
+  if (!nom || prix < 0) return redirect(withMsg(back, 'err', 'Nom et prix obligatoires.'));
+  const up = await storeImage(env, b.id, f.get('image'));
+  if (up.error) return redirect(withMsg(back, 'err', up.error));
+  const vals = [nom, clean(f.get('description'), 1200), prix, Math.max(0, int(f.get('stock'), 0)), Math.max(0, int(f.get('ordre'), 0))];
+  if (existing) {
+    if (up.url) await dropImage(env, existing.image_url);
+    await env.DB.prepare('UPDATE offres SET nom=?, description=?, prix_xpf=?, stock=?, ordre=?, image_url=? WHERE id=? AND boutique_id=?')
+      .bind(...vals, up.url || existing.image_url, id, b.id).run();
+  } else {
+    await env.DB.prepare('INSERT INTO offres (id, boutique_id, nom, description, prix_xpf, stock, ordre, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(uid(), b.id, ...vals, up.url).run();
+  }
+  return redirect(withMsg('/tableau-de-bord/produits', 'ok', existing ? 'Produit enregistré.' : 'Produit ajouté.'));
+}
+
+async function productDelete(env, b, id) {
+  const o = await env.DB.prepare('SELECT image_url FROM offres WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+  if (!o) return notFound();
+  await dropImage(env, o.image_url);
+  await env.DB.prepare('DELETE FROM offres WHERE id = ? AND boutique_id = ?').bind(id, b.id).run();
+  return redirect(withMsg('/tableau-de-bord/produits', 'ok', 'Produit supprimé.'));
+}
+
+// ───────────── Commandes ─────────────
+
+async function orderList(env, url, b) {
+  const st = ORDER_STATUSES[url.searchParams.get('statut')] ? url.searchParams.get('statut') : '';
+  const q = st
+    ? env.DB.prepare('SELECT * FROM commandes WHERE boutique_id = ? AND statut = ? ORDER BY cree_le DESC, rowid DESC LIMIT 200').bind(b.id, st)
+    : env.DB.prepare('SELECT * FROM commandes WHERE boutique_id = ? ORDER BY cree_le DESC, rowid DESC LIMIT 200').bind(b.id);
+  const { results } = await q.all();
+  const tabs = [['', 'Toutes'], ...Object.entries(ORDER_STATUSES)].map(([k, v]) =>
+    `<a class="btn small ${k === st ? '' : 'ghost'}" href="/tableau-de-bord/commandes${k ? '?statut=' + k : ''}">${v}</a>`).join(' ');
+  const body = `${flash(url)}<div class="card"><h1>Commandes</h1><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">${tabs}</div>
+    ${results.length ? `<div class="table-scroll"><table><thead><tr><th>Date</th><th>Client</th><th>Total</th><th>Paiement</th><th>Statut</th><th></th></tr></thead><tbody>
+    ${results.map((o) => `<tr><td>${fmtDate(o.cree_le)}${o.numero_facture ? `<br><span class="small muted">${esc(o.numero_facture)}</span>` : ''}</td>
+      <td>${esc(o.client_nom)}<br><span class="small muted">${esc(o.ile || '')} · ${esc(o.client_telephone || '')}</span></td>
+      <td>${fmtXpf(o.total_xpf)}</td><td class="small">${esc(PAYMENT_METHODS[o.moyen])}</td>
+      <td><span class="badge ${esc(o.statut)}">${esc(ORDER_STATUSES[o.statut])}</span></td>
+      <td><a class="btn small ghost" href="/tableau-de-bord/commandes/${o.id}">Ouvrir</a></td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="muted">Aucune commande.</p>'}</div>`;
+  return dash('Commandes', '/tableau-de-bord/commandes', body);
+}
+
+async function orderDetail(env, url, b, id) {
+  const o = await env.DB.prepare('SELECT * FROM commandes WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+  if (!o) return notFound();
+  const lignes = JSON.parse(o.lignes_json);
+  const next = NEXT_STATUS[o.statut];
+  const factureUrl = `${url.origin}/f/${o.id}`;
+  const share = o.numero_facture ? `
+    <a class="btn small ghost" href="/f/${o.id}" target="_blank" rel="noopener">Voir la facture ${esc(o.numero_facture)}</a>
+    <a class="btn small ghost" href="mailto:${esc(o.client_email)}?subject=${encodeURIComponent(`Votre facture ${o.numero_facture} — ${b.nom}`)}&body=${encodeURIComponent(`Bonjour ${o.client_nom},\n\nMerci pour votre commande. Votre facture : ${factureUrl}\n\n${b.nom}`)}">Envoyer par e-mail</a>
+    ${o.client_telephone ? `<a class="btn small ghost" target="_blank" rel="noopener" href="https://wa.me/${esc((o.client_telephone || '').replace(/\D/g, '').replace(/^(\d{8})$/, '689$1'))}?text=${encodeURIComponent(`Ia ora na ${o.client_nom}, voici votre facture ${o.numero_facture} : ${factureUrl}`)}">Envoyer par WhatsApp</a>` : ''}` : '';
+  const body = `${flash(url)}<div class="card noprint"><p><a href="/tableau-de-bord/commandes">← Commandes</a></p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      ${next ? `<form method="post" action="/tableau-de-bord/commandes/${o.id}/avancer"><button class="btn small">${next === 'payee' ? 'Marquer payée (émet la facture)' : 'Marquer expédiée'}</button></form>` : ''}
+      <button class="btn small ghost" type="button" onclick="window.print()">Imprimer bon + étiquette</button>
+      ${o.statut === 'en_attente' ? `<form method="post" action="/tableau-de-bord/commandes/${o.id}/supprimer" onsubmit="return confirm('Supprimer cette commande ? Le stock sera remis.')"><button class="btn small danger">Supprimer</button></form>` : ''}
+      ${share}
+    </div></div>
+  <div class="card"><h1>Bon de commande</h1>
+    <p class="muted">${esc(b.nom)} · ${fmtDate(o.cree_le)} · ${esc(PAYMENT_METHODS[o.moyen])} · <span class="badge ${esc(o.statut)}">${esc(ORDER_STATUSES[o.statut])}</span></p>
+    <table><thead><tr><th>Article</th><th>Qté</th><th>Prix</th><th>Sous-total</th></tr></thead><tbody>
+    ${lignes.map((l) => `<tr><td>${esc(l.nom)}</td><td>${l.qte}</td><td>${fmtXpf(l.prix)}</td><td>${fmtXpf(l.prix * l.qte)}</td></tr>`).join('')}
+    <tr><td colspan="3"><b>Total</b></td><td><b>${fmtXpf(o.total_xpf)}</b></td></tr></tbody></table>
+    ${o.note ? `<p><b>Note du client :</b> ${esc(o.note)}</p>` : ''}
+    <p class="small muted">Client : ${esc(o.client_email)}</p></div>
+  <div class="card" style="border:2px dashed #222;max-width:430px">
+    <p class="small" style="margin:0">EXPÉDITEUR : ${esc(b.nom)}${b.ile ? ' — ' + esc(b.ile) : ''}${b.telephone ? ' — ' + esc(b.telephone) : ''}</p>
+    <h2 style="margin:14px 0 6px">${esc(o.client_nom)}</h2>
+    <p style="margin:0;white-space:pre-line;font-size:1.1rem">${esc(o.client_adresse)}</p>
+    <p style="margin:6px 0 0;font-size:1.2rem;font-weight:700">${esc(o.ile || '')} — Polynésie française</p>
+    <p class="small" style="margin:8px 0 0">Tél. ${esc(o.client_telephone || '')} · Réf. ${esc(o.id.slice(0, 8).toUpperCase())}</p></div>`;
+  return dash('Commande', '/tableau-de-bord/commandes', body);
+}
+
+async function orderAdvance(env, b, id) {
+  const back = `/tableau-de-bord/commandes/${id}`;
+  const o = await env.DB.prepare('SELECT statut FROM commandes WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+  if (!o) return notFound();
+  const target = NEXT_STATUS[o.statut];
+  if (!target) return redirect(back);
+  const r = await env.DB.prepare('UPDATE commandes SET statut = ? WHERE id = ? AND boutique_id = ? AND statut = ?').bind(target, id, b.id, o.statut).run();
+  if (!r.meta.changes) return redirect(withMsg(back, 'err', 'La commande a déjà été mise à jour.'));
+  if (target === 'payee') {
+    // Numéro de facture séquentiel par boutique, attribué une seule fois, puis comptage de la vente payée du mois.
+    const { dernier_numero: n } = await env.DB.prepare(`INSERT INTO compteurs_factures (boutique_id, dernier_numero) VALUES (?, 1)
+      ON CONFLICT(boutique_id) DO UPDATE SET dernier_numero = dernier_numero + 1 RETURNING dernier_numero`).bind(b.id).first();
+    const numero = `F${yearKey()}-${String(n).padStart(4, '0')}`;
+    await env.DB.batch([
+      env.DB.prepare('UPDATE commandes SET numero_facture = ? WHERE id = ? AND numero_facture IS NULL').bind(numero, id),
+      env.DB.prepare(`INSERT INTO ventes_mensuelles (boutique_id, mois, ventes_count) VALUES (?, ?, 1)
+        ON CONFLICT(boutique_id, mois) DO UPDATE SET ventes_count = ventes_count + 1`).bind(b.id, monthKey()),
+    ]);
+    return redirect(withMsg(back, 'ok', `Paiement enregistré. Facture ${numero} émise.`));
+  }
+  return redirect(withMsg(back, 'ok', 'Commande marquée expédiée.'));
+}
+
+async function orderDelete(env, b, id) {
+  const o = await env.DB.prepare(`SELECT * FROM commandes WHERE id = ? AND boutique_id = ? AND statut = 'en_attente'`).bind(id, b.id).first();
+  if (!o) return redirect(withMsg('/tableau-de-bord/commandes', 'err', 'Seule une commande en attente peut être supprimée.'));
+  const lignes = JSON.parse(o.lignes_json);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM commandes WHERE id = ? AND boutique_id = ?').bind(id, b.id),
+    ...lignes.map((l) => env.DB.prepare('UPDATE offres SET stock = stock + ? WHERE id = ? AND boutique_id = ?').bind(l.qte, l.id, b.id)),
+  ]);
+  return redirect(withMsg('/tableau-de-bord/commandes', 'ok', 'Commande supprimée, stock remis.'));
+}
+
+// ───────────── Dossier OSB (paiement par carte) ─────────────
+
+async function osbForm(env, url, b, who) {
+  const { results } = await env.DB.prepare('SELECT * FROM dossiers_osb WHERE boutique_id = ? ORDER BY cree_le DESC').bind(b.id).all();
+  const body = `${flash(url)}<div class="card"><h1>Paiement par carte (OSB)</h1>
+    <p>Pour accepter la carte bancaire, votre boutique a besoin d’un contrat de paiement en ligne auprès d’OSB, ouvert à votre nom. Remplissez ce dossier : nous le préparons avec vous et le transmettons.</p>
+    <p class="small muted">L’abonnement OSB est réglé directement par vous à OSB ; il n’est pas inclus dans votre formule Hinova.</p></div>
+  ${results.length ? `<div class="card"><h2>Mes demandes</h2><table><tbody>${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.raison_sociale)}</td><td><span class="badge ${esc(d.statut)}">${esc(OSB_STATUTS[d.statut] || d.statut)}</span></td></tr>`).join('')}</tbody></table></div>` : ''}
+  <div class="card"><h2>Nouvelle demande</h2><form method="post">
+    <div class="row">
+      <div><label for="rs">Raison sociale ou nom commercial</label><input id="rs" name="raison_sociale" required maxlength="120" value="${esc(b.nom)}"></div>
+      <div><label for="nt">N° Tahiti</label><input id="nt" name="numero_tahiti" maxlength="20" value="${esc(b.numero_tahiti || '')}"></div>
+    </div>
+    <div class="row">
+      <div><label for="re">Responsable</label><input id="re" name="responsable" required maxlength="80"></div>
+      <div><label for="te">Téléphone</label><input id="te" name="telephone" required maxlength="30" value="${esc(b.telephone || '')}"></div>
+      <div><label for="em">E-mail</label><input id="em" name="email" type="email" required maxlength="120" value="${esc(who.email)}"></div>
+    </div>
+    <label for="bq">Banque du compte professionnel</label><select id="bq" name="banque" required>${BANQUES.map((x) => `<option ${x === b.banque ? 'selected' : ''}>${x}</option>`).join('')}</select>
+    <button class="btn" type="submit">Envoyer la demande</button></form></div>`;
+  return dash('Paiement carte', '/tableau-de-bord/osb', body);
+}
+
+async function osbPost(request, env, b) {
+  const f = await readForm(request);
+  const d = {
+    raison_sociale: clean(f.get('raison_sociale'), 120), numero_tahiti: clean(f.get('numero_tahiti'), 20),
+    responsable: clean(f.get('responsable'), 80), telephone: clean(f.get('telephone'), 30),
+    email: clean(f.get('email'), 120).toLowerCase(), banque: BANQUES.includes(f.get('banque')) ? f.get('banque') : '',
+  };
+  if (!d.raison_sociale || !d.responsable || !d.telephone || !isEmail(d.email) || !d.banque) {
+    return redirect(withMsg('/tableau-de-bord/osb', 'err', 'Merci de remplir tous les champs obligatoires.'));
+  }
+  const id = uid();
+  await env.DB.prepare(`INSERT INTO dossiers_osb (id, boutique_id, raison_sociale, numero_tahiti, responsable, telephone, email, banque)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, b.id, d.raison_sociale, d.numero_tahiti, d.responsable, d.telephone, d.email, d.banque).run();
+  if (env.OSB_WEBHOOK_URL) {
+    try {
+      await fetch(env.OSB_WEBHOOK_URL, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'dossier_osb', id, boutique: { id: b.id, nom: b.nom, domaine: b.domaine }, ...d, cree_le: nowIso() }) });
+    } catch (e) { console.error('Webhook OSB en échec', e); }
+  }
+  return redirect(withMsg('/tableau-de-bord/osb', 'ok', 'Demande envoyée. Nous revenons vers vous rapidement.'));
+}
+
+// ───────────────────────────── Vitrines ─────────────────────────────
+
+function renderStore(b, offres, sections, { base, demo = false, flashHtml = '' }) {
+  const c = storeColors(b);
+  const methods = demo ? ['virement', 'ccp', 'carte'] : methodsOf(b);
+  const ctx = { b, offres, base, demo, methods, canOrder: methods.length > 0 && offres.some((o) => o.stock > 0), ...c };
+  const annonce = renderSections(sections.filter((s) => s.type === 'annonce'), ctx);
+  const body = (flashHtml ? `<div class="wrap">${flashHtml}</div>` : '') + renderSections(sections.filter((s) => s.type !== 'annonce'), ctx);
+  return storePage(b, { title: b.nom, body, base, annonce, description: b.slogan || `Boutique ${b.nom}` });
+}
+
+function demoStore(modele) {
+  const d = demoBoutique(modele);
+  if (!d) return notFound();
+  return html(renderStore(d.boutique, d.offres, d.sections, { base: `/demo/${modele}`, demo: true }), 200, {
+    'x-frame-options': 'SAMEORIGIN', 'content-security-policy': "frame-ancestors 'self'", 'cache-control': 'public, max-age=600', 'x-robots-tag': 'noindex',
+  });
+}
+
+async function storefront(request, env, url, domaine, sub, base) {
+  const b = await env.DB.prepare('SELECT * FROM boutiques WHERE domaine = ?').bind(domaine.toLowerCase()).first();
+  if (!b) return notFound();
+  if (isOffline(b, env)) {
+    return html(storePage(b, { title: 'Boutique indisponible', base, body: '<section class="s"><div class="wrap narrow"><h1>Boutique momentanément indisponible</h1><p class="muted">Revenez bientôt.</p></div></section>' }), 503, { 'cache-control': 'no-store' });
+  }
+  if (sub === '/' && request.method === 'GET') {
+    const { results } = await env.DB.prepare('SELECT * FROM offres WHERE boutique_id = ? ORDER BY ordre, rowid').bind(b.id).all();
+    const msg = url.searchParams.get('err') ? `<div class="flash err" role="alert">${esc(url.searchParams.get('err'))}</div>` : '';
+    return html(renderStore(b, results, parseSections(b.sections_json, b), { base, flashHtml: msg }));
+  }
+  if (sub === '/commander' && request.method === 'POST') return placeOrder(request, env, b, base);
+  const m = sub.match(/^\/commande\/([a-f0-9]{32})$/);
+  if (m && request.method === 'GET') return orderConfirmation(env, b, m[1], base);
+  return notFound();
+}
+
+async function placeOrder(request, env, b, base) {
+  const back = (msg) => redirect(withMsg(`${base}/`, 'err', msg) + '#produits');
+  const f = await readForm(request);
+  if (f.get('site_web')) return back('Commande refusée.');
+  const moyen = String(f.get('moyen') || '');
+  if (!methodsOf(b).includes(moyen)) return back('Choisissez un moyen de paiement.');
+  const c = {
+    nom: clean(f.get('client_nom'), 80), tel: clean(f.get('client_telephone'), 30), email: clean(f.get('client_email'), 120).toLowerCase(),
+    adresse: clean(f.get('client_adresse'), 400), ile: ISLANDS.includes(f.get('ile')) ? f.get('ile') : '', note: clean(f.get('note'), 300),
+  };
+  if (!c.nom || !c.tel || !c.adresse || !c.ile) return back('Merci de remplir nom, téléphone, adresse et île.');
+  if (!isEmail(c.email)) return back('Adresse e-mail invalide.');
+
+  const wanted = [];
+  for (const [k, v] of f.entries()) if (k.startsWith('q_')) { const q = int(v, 0); if (q > 0) wanted.push({ id: k.slice(2), qte: Math.min(q, 999) }); }
+  if (!wanted.length) return back('Choisissez au moins un produit.');
+  if (wanted.length > 40) return back('Commande trop longue.');
+
+  const { results: offres } = await env.DB.prepare(`SELECT id, nom, prix_xpf, stock FROM offres WHERE boutique_id = ? AND id IN (${wanted.map(() => '?').join(',')})`)
+    .bind(b.id, ...wanted.map((w) => w.id)).all();
+  const byId = Object.fromEntries(offres.map((o) => [o.id, o]));
+  const lignes = [];
+  for (const w of wanted) {
+    const o = byId[w.id];
+    if (!o) return back('Un produit n’est plus disponible.');
+    if (o.stock < w.qte) return back(`Stock insuffisant pour « ${o.nom} » (reste ${o.stock}).`);
+    lignes.push({ id: o.id, nom: o.nom, qte: w.qte, prix: o.prix_xpf });
+  }
+  // Réservation atomique du stock, produit par produit ; retour arrière si un autre client a été plus rapide.
+  const done = [];
+  const release = () => done.length && env.DB.batch(done.map((l) => env.DB.prepare('UPDATE offres SET stock = stock + ? WHERE id = ? AND boutique_id = ?').bind(l.qte, l.id, b.id)));
+  for (const l of lignes) {
+    const r = await env.DB.prepare('UPDATE offres SET stock = stock - ? WHERE id = ? AND boutique_id = ? AND stock >= ?').bind(l.qte, l.id, b.id, l.qte).run();
+    if (!r.meta.changes) { await release(); return back(`« ${l.nom} » vient d’être épuisé.`); }
+    done.push(l);
+  }
+  const id = uid();
+  try {
+    await env.DB.prepare(`INSERT INTO commandes (id, boutique_id, client_nom, client_email, client_adresse, lignes_json, total_xpf, moyen, client_telephone, ile, note)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, b.id, c.nom, c.email, c.adresse, JSON.stringify(lignes), lignes.reduce((s, l) => s + l.prix * l.qte, 0), moyen, c.tel, c.ile, c.note).run();
+  } catch (e) { await release(); throw e; }
+  return redirect(`${base}/commande/${id}`);
+}
+
+async function orderConfirmation(env, b, id, base) {
+  const o = await env.DB.prepare('SELECT * FROM commandes WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
+  if (!o) return notFound();
+  const lignes = JSON.parse(o.lignes_json);
+  const ref = o.id.slice(0, 8).toUpperCase();
+  const pay = {
+    virement: `<p>Faites un virement de <b>${fmtXpf(o.total_xpf)}</b> avec la référence <b>${ref}</b> :</p><pre class="pay">${esc(b.rib)}</pre>`,
+    ccp: `<p>Réglez <b>${fmtXpf(o.total_xpf)}</b> en espèces au guichet avec la référence <b>${ref}</b> :</p><pre class="pay">${esc(b.consignes_ccp)}</pre>`,
+    carte: `<p>Réglez <b>${fmtXpf(o.total_xpf)}</b> sur la page de paiement sécurisée de la banque, en indiquant la référence <b>${ref}</b>.</p><a class="btn" href="${esc(b.lien_paiement_carte)}" target="_blank" rel="noopener">Payer par carte</a>`,
+  }[o.moyen] || '';
+  const wa = b.whatsapp ? `<a class="btn btn-ghost" href="https://wa.me/${esc(b.whatsapp)}?text=${encodeURIComponent(`Bonjour, je viens de passer la commande ${ref} (${fmtXpf(o.total_xpf)}).`)}" target="_blank" rel="noopener">Prévenir la boutique sur WhatsApp</a>` : '';
+  const body = `<section class="s"><div class="wrap narrow">
+    <h1>Merci, commande enregistrée</h1><p>Référence : <b>${ref}</b>. Notez-la pour votre paiement.</p>
+    <ul>${lignes.map((l) => `<li>${l.qte} × ${esc(l.nom)} — ${fmtXpf(l.prix * l.qte)}</li>`).join('')}</ul>
+    <p><b>Total : ${fmtXpf(o.total_xpf)}</b></p>
+    <h2>Paiement</h2>${pay}
+    <p class="muted">${esc(b.nom)} prépare votre commande dès réception du paiement ; votre facture vous sera envoyée.</p>
+    <div class="row-btn">${wa}<a class="btn btn-ghost" href="${esc(base || '/')}">Retour à la boutique</a></div></div></section>`;
+  return html(storePage(b, { title: `Commande ${ref}`, body, base }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
+}
+
+async function invoicePage(env, id) {
+  if (!/^[a-f0-9]{32}$/.test(id)) return notFound();
+  const o = await env.DB.prepare('SELECT * FROM commandes WHERE id = ? AND numero_facture IS NOT NULL').bind(id).first();
+  if (!o) return notFound();
+  const b = await env.DB.prepare('SELECT * FROM boutiques WHERE id = ?').bind(o.boutique_id).first();
+  const lignes = JSON.parse(o.lignes_json);
+  const body = `<div class="card">
+    <div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div>${b.logo_url ? `<img src="${esc(b.logo_url)}" alt="" style="height:48px;width:auto;margin-bottom:8px">` : ''}
+        <b>${esc(b.nom)}</b><br>${b.numero_tahiti ? `N° Tahiti : ${esc(b.numero_tahiti)}<br>` : ''}${esc(b.ile || '')}${b.telephone ? ' · ' + esc(b.telephone) : ''}</div>
+      <div style="text-align:right"><h1 style="margin:0">Facture</h1><b>${esc(o.numero_facture)}</b><br><span class="muted">Commande du ${fmtDate(o.cree_le)}</span></div>
+    </div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+    <p><b>Client</b><br>${esc(o.client_nom)}<br><span style="white-space:pre-line">${esc(o.client_adresse)}</span><br>${esc(o.ile || '')}<br>${esc(o.client_email)}</p>
+    <table><thead><tr><th>Désignation</th><th>Qté</th><th>Prix unitaire</th><th>Montant</th></tr></thead><tbody>
+    ${lignes.map((l) => `<tr><td>${esc(l.nom)}</td><td>${l.qte}</td><td>${fmtXpf(l.prix)}</td><td>${fmtXpf(l.prix * l.qte)}</td></tr>`).join('')}
+    <tr><td colspan="3"><b>Total</b></td><td><b>${fmtXpf(o.total_xpf)}</b></td></tr></tbody></table>
+    <p class="small">Réglée par ${esc(PAYMENT_METHODS[o.moyen])}.</p>
+    ${b.mentions_facture ? `<p class="small muted" style="white-space:pre-line">${esc(b.mentions_facture)}</p>` : ''}
+    <button class="btn small ghost noprint" onclick="window.print()">Imprimer / PDF</button></div>`;
+  return html(appPage({ title: `Facture ${o.numero_facture} — ${b.nom}`, body, brandHref: '/' }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
 }
 
 // ───────────────────────────── Administration Hinova ─────────────────────────────
 
-function isAdmin(request, env) {
-  return !!env.ADMIN_TOKEN && safeEqual(getCookie(request, ADMIN_COOKIE) || '', env.ADMIN_TOKEN);
-}
-
 async function admin(request, env, url, sub) {
-  if (sub[0] === 'connexion') {
-    if (request.method === 'POST') {
-      const f = await readForm(request);
-      if (env.ADMIN_TOKEN && safeEqual(String(f.get('token') || ''), env.ADMIN_TOKEN)) {
-        return redirect('/admin', { 'set-cookie': setCookie(ADMIN_COOKIE, env.ADMIN_TOKEN, 12 * 3600) });
-      }
-      return redirect('/admin/connexion?err=' + encodeURIComponent('Clé incorrecte.'));
-    }
-    return html(page({ title: 'Admin', body: `<div class="card" style="max-width:420px;margin:0 auto"><h1>Administration</h1>${flash(url)}
-      <form method="post"><label for="tk">Clé d’administration</label><input id="tk" name="token" type="password" required><button class="btn">Entrer</button></form></div>` }));
+  const post = request.method === 'POST';
+  if (sub[0] === 'b' && sub[1] && sub[2] && post) return adminBoutiqueAction(request, env, sub[1], sub[2]);
+  if (sub[0] === 'osb') {
+    if (sub[1] && sub[2] === 'statut' && post) return adminOsbStatus(request, env, sub[1]);
+    return adminOsb(env, url);
   }
-  if (!isAdmin(request, env)) return redirect('/admin/connexion');
-
-  if (request.method === 'POST' && sub[0] && sub[1]) return adminAction(request, env, sub[0], sub[1]);
-
-  const { results } = await env.DB.prepare(`SELECT t.*,
-      (SELECT COUNT(*) FROM products p WHERE p.tenant_id = t.id) AS n_products,
-      (SELECT COUNT(*) FROM orders o WHERE o.tenant_id = t.id AND o.status != 'annulee' AND o.created_at >= ?) AS n_sales,
-      (SELECT COUNT(*) FROM orders o WHERE o.tenant_id = t.id AND o.over_quota = 1 AND o.status != 'annulee' AND o.created_at >= ?) AS n_over
-    FROM tenants t ORDER BY t.created_at DESC`).bind(monthStartSql(), monthStartSql()).all();
-  const active = results.filter((t) => t.status === 'actif');
-  const mrr = active.reduce((s, t) => s + (t.billing === 'annuel' ? Math.round(annualPrice(getPlan(t.plan)) / 12) : getPlan(t.plan).monthly), 0);
-  const rows = results.map((t) => {
-    const plan = getPlan(t.plan);
-    return `<tr>
-      <td><b>${esc(t.name)}</b><br><a class="small" href="/s/${esc(t.slug)}" target="_blank">/s/${esc(t.slug)}</a><br><span class="small muted">${esc(t.email)}</span></td>
-      <td>${esc(plan.label)}<br><span class="small muted">${esc(t.billing)}</span></td>
-      <td><span class="badge ${esc(t.status)}">${esc(t.status)}</span><br><span class="small muted">jusqu’au ${fmtDate(t.paid_until)}</span></td>
-      <td>${t.n_products}/${plan.maxProducts}<br><span class="small muted">${t.n_sales}/${plan.salesQuota} ventes${t.n_over ? ` · <b style="color:var(--danger)">${t.n_over} hors quota</b>` : ''}</span></td>
-      <td style="min-width:220px">
-        <form method="post" action="/admin/${t.id}/paiement" class="row" style="gap:6px;align-items:center">
-          <select name="months" style="width:auto"><option value="1">+1 mois</option><option value="12">+12 mois (annuel)</option></select>
-          <button class="btn small">Encaisser</button></form>
-        <form method="post" action="/admin/${t.id}/formule" class="row" style="gap:6px;align-items:center;margin-top:6px">
-          <select name="plan" style="width:auto">${Object.values(PLANS).map((p) => `<option value="${p.key}" ${p.key === t.plan ? 'selected' : ''}>${p.label}</option>`).join('')}</select>
-          <button class="btn small ghost">Changer</button></form>
-        <form method="post" action="/admin/${t.id}/${t.status === 'suspendu' ? 'reactiver' : 'suspendre'}" style="margin-top:6px">
-          <button class="btn small ${t.status === 'suspendu' ? 'ghost' : 'danger'}">${t.status === 'suspendu' ? 'Réactiver' : 'Suspendre'}</button></form>
+  const now = nowIso();
+  const { results } = await env.DB.prepare(`SELECT b.*,
+      (SELECT COUNT(*) FROM offres o WHERE o.boutique_id = b.id) AS n_offres,
+      (SELECT COALESCE(ventes_count, 0) FROM ventes_mensuelles v WHERE v.boutique_id = b.id AND v.mois = ?) AS n_ventes,
+      (SELECT email_google FROM utilisateurs u WHERE u.boutique_id = b.id LIMIT 1) AS email
+    FROM boutiques b ORDER BY b.cree_le DESC, b.rowid DESC`).bind(monthKey()).all();
+  const payees = results.filter((b) => b.statut === 'active' && b.date_echeance && b.date_echeance > now);
+  const mrr = payees.reduce((s, b) => s + (b.cycle === 'annuel' ? Math.round(annualPrice(getPlan(b.plan)) / 12) : getPlan(b.plan).monthly), 0);
+  const osb = (await env.DB.prepare(`SELECT COUNT(*) AS n FROM dossiers_osb WHERE statut = 'en_attente'`).first()).n;
+  const rows = results.map((b) => {
+    const pl = getPlan(b.plan);
+    return `<tr><td><b>${esc(b.nom)}</b><br><a class="small" href="${esc(storeUrl(env, b, url.origin))}" target="_blank" rel="noopener">${esc(b.domaine)}</a><br><span class="small muted">${esc(b.email || '')}</span></td>
+      <td>${esc(pl.label)}<br><span class="small muted">${esc(b.cycle)} · ${esc(getModele(b.modele).label)}</span></td>
+      <td><span class="badge ${esc(b.statut)}">${esc(b.statut)}</span><br><span class="small muted">jusqu’au ${fmtDate(b.date_echeance)}</span></td>
+      <td>${b.n_offres}/${pl.maxProducts} produits<br><span class="small ${(b.n_ventes || 0) > pl.salesQuota ? '' : 'muted'}">${b.n_ventes || 0}/${pl.salesQuota} ventes</span></td>
+      <td style="min-width:230px">
+        <form method="post" action="/admin/b/${b.id}/paiement" style="display:flex;gap:6px"><select name="mois" style="width:auto"><option value="1">+1 mois</option><option value="12">+12 mois</option></select><button class="btn small">Encaisser</button></form>
+        <form method="post" action="/admin/b/${b.id}/plan" style="display:flex;gap:6px;margin-top:6px"><select name="plan" style="width:auto">${Object.values(PLANS).map((p) => `<option value="${p.key}" ${p.key === b.plan ? 'selected' : ''}>${p.label}</option>`).join('')}</select><button class="btn small ghost">Changer</button></form>
+        <form method="post" action="/admin/b/${b.id}/${b.statut === 'suspendue' ? 'reactiver' : 'suspendre'}" style="margin-top:6px"><button class="btn small ${b.statut === 'suspendue' ? 'ghost' : 'danger'}">${b.statut === 'suspendue' ? 'Réactiver' : 'Suspendre'}</button></form>
       </td></tr>`;
   }).join('');
-  const body = `${flash(url)}
-  <div class="stats">
-    <div class="stat"><b>${results.length}</b><span>boutiques</span></div>
-    <div class="stat"><b>${active.length}</b><span>abonnées actives</span></div>
-    <div class="stat"><b>${results.filter((t) => t.status === 'essai').length}</b><span>en essai</span></div>
-    <div class="stat"><b>${fmtXpf(mrr)}</b><span>revenu mensuel récurrent</span></div>
-  </div>
-  <div class="card"><h1>Boutiques</h1><div class="table-scroll"><table><thead><tr><th>Boutique</th><th>Formule</th><th>Statut</th><th>Usage</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="muted">Aucune boutique.</td></tr>'}</tbody></table></div></div>`;
-  return html(page({ title: 'Administration', body, brand: 'Hinova Boutiques — Admin', brandHref: '/admin' }), 200, { 'cache-control': 'no-store' });
+  const body = `${flash(url)}<div class="stats">
+      <div class="stat"><b>${results.length}</b><span>boutiques</span></div>
+      <div class="stat"><b>${payees.length}</b><span>à jour</span></div>
+      <div class="stat"><b>${fmtXpf(mrr)}</b><span>revenu mensuel récurrent</span></div>
+      <div class="stat"><b>${osb}</b><span><a href="/admin/osb">dossiers OSB à traiter</a></span></div></div>
+    <div class="card"><h1>Boutiques</h1><div class="table-scroll"><table><thead><tr><th>Boutique</th><th>Formule</th><th>Statut</th><th>Usage du mois</th><th>Actions</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="5" class="muted">Aucune boutique.</td></tr>'}</tbody></table></div></div>`;
+  return html(appPage({ title: 'Administration', body, nav: adminNav('/admin'), brandHref: '/admin' }), 200, { 'cache-control': 'no-store' });
 }
 
-async function adminAction(request, env, tenantId, action) {
-  const t = await env.DB.prepare('SELECT * FROM tenants WHERE id = ?').bind(tenantId).first();
-  if (!t) return notFound();
+async function adminBoutiqueAction(request, env, id, action) {
+  const b = await env.DB.prepare('SELECT * FROM boutiques WHERE id = ?').bind(id).first();
+  if (!b) return notFound();
   const f = await readForm(request);
-  const log = (kind, detail) => env.DB.prepare('INSERT INTO billing_events (id, tenant_id, kind, detail) VALUES (?, ?, ?, ?)').bind(uid('b_'), t.id, kind, detail);
-  let msg = '';
+  let msg;
   if (action === 'paiement') {
-    const months = f.get('months') === '12' ? 12 : 1;
-    const from = new Date(t.paid_until) > new Date() ? t.paid_until : nowIso();
-    const until = addMonths(from, months);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE tenants SET status = 'actif', paid_until = ?, billing = ? WHERE id = ?`).bind(until, months === 12 ? 'annuel' : 'mensuel', t.id),
-      log('paiement', `+${months} mois, jusqu'au ${until.slice(0, 10)}`),
-    ]);
-    msg = `${t.name} : réglé jusqu’au ${fmtDate(until)}.`;
-  } else if (action === 'formule' && PLANS[f.get('plan')]) {
-    await env.DB.batch([env.DB.prepare('UPDATE tenants SET plan = ? WHERE id = ?').bind(f.get('plan'), t.id), log('changement_plan', `${t.plan} → ${f.get('plan')}`)]);
-    msg = `${t.name} : formule mise à jour.`;
+    const mois = f.get('mois') === '12' ? 12 : 1;
+    const from = b.date_echeance && new Date(b.date_echeance) > new Date() ? b.date_echeance : nowIso();
+    const until = addMonths(from, mois);
+    await env.DB.prepare(`UPDATE boutiques SET statut = 'active', date_echeance = ?, cycle = ? WHERE id = ?`).bind(until, mois === 12 ? 'annuel' : 'mensuel', id).run();
+    msg = `${b.nom} : réglée jusqu’au ${fmtDate(until)}.`;
+  } else if (action === 'plan' && PLANS[f.get('plan')]) {
+    await env.DB.prepare('UPDATE boutiques SET plan = ? WHERE id = ?').bind(f.get('plan'), id).run();
+    msg = `${b.nom} : formule ${getPlan(f.get('plan')).label}.`;
   } else if (action === 'suspendre') {
-    await env.DB.batch([env.DB.prepare(`UPDATE tenants SET status = 'suspendu' WHERE id = ?`).bind(t.id), log('suspension', 'manuelle')]);
-    msg = `${t.name} : suspendue.`;
+    await env.DB.prepare(`UPDATE boutiques SET statut = 'suspendue' WHERE id = ?`).bind(id).run();
+    msg = `${b.nom} : suspendue.`;
   } else if (action === 'reactiver') {
-    const until = new Date(t.paid_until) > new Date() ? t.paid_until : addDays(nowIso(), 7);
-    await env.DB.batch([env.DB.prepare(`UPDATE tenants SET status = 'actif', paid_until = ? WHERE id = ?`).bind(until, t.id), log('reactivation', 'manuelle')]);
-    msg = `${t.name} : réactivée.`;
-  } else {
-    return notFound();
-  }
-  return redirect('/admin?ok=' + encodeURIComponent(msg));
+    const until = b.date_echeance && new Date(b.date_echeance) > new Date() ? b.date_echeance : addDays(nowIso(), 7);
+    await env.DB.prepare(`UPDATE boutiques SET statut = 'active', date_echeance = ? WHERE id = ?`).bind(until, id).run();
+    msg = `${b.nom} : réactivée.`;
+  } else return notFound();
+  return redirect(withMsg('/admin', 'ok', msg));
+}
+
+async function adminOsb(env, url) {
+  const { results } = await env.DB.prepare(`SELECT d.*, b.nom AS boutique FROM dossiers_osb d JOIN boutiques b ON b.id = d.boutique_id ORDER BY d.cree_le DESC LIMIT 200`).all();
+  const body = `${flash(url)}<div class="card"><h1>Dossiers OSB</h1>${results.length ? `<div class="table-scroll"><table><thead><tr><th>Date</th><th>Boutique</th><th>Demandeur</th><th>Banque</th><th>Statut</th></tr></thead><tbody>
+    ${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.boutique)}<br><span class="small muted">${esc(d.raison_sociale)} · ${esc(d.numero_tahiti || 's. n° Tahiti')}</span></td>
+      <td>${esc(d.responsable)}<br><span class="small muted">${esc(d.telephone)} · ${esc(d.email)}</span></td><td>${esc(d.banque)}</td>
+      <td><form method="post" action="/admin/osb/${d.id}/statut" style="display:flex;gap:6px"><select name="statut" style="width:auto">${Object.entries(OSB_STATUTS).map(([k, v]) => `<option value="${k}" ${k === d.statut ? 'selected' : ''}>${v}</option>`).join('')}</select><button class="btn small ghost">OK</button></form></td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="muted">Aucun dossier.</p>'}</div>`;
+  return html(appPage({ title: 'Dossiers OSB', body, nav: adminNav('/admin/osb'), brandHref: '/admin' }), 200, { 'cache-control': 'no-store' });
+}
+
+async function adminOsbStatus(request, env, id) {
+  const f = await readForm(request);
+  const st = OSB_STATUTS[f.get('statut')] ? f.get('statut') : null;
+  if (st) await env.DB.prepare('UPDATE dossiers_osb SET statut = ? WHERE id = ?').bind(st, id).run();
+  return redirect(withMsg('/admin/osb', 'ok', 'Dossier mis à jour.'));
 }
 
 // ───────────────────────────── Tâche planifiée ─────────────────────────────
 
 export async function suspendOverdue(env) {
   const limit = addDays(nowIso(), -int(env.GRACE_DAYS, 3));
-  const { results } = await env.DB.prepare(`SELECT id FROM tenants WHERE status != 'suspendu' AND paid_until < ?`).bind(limit).all();
-  if (!results.length) return 0;
-  const stmts = [];
-  for (const r of results) {
-    stmts.push(env.DB.prepare(`UPDATE tenants SET status = 'suspendu' WHERE id = ?`).bind(r.id));
-    stmts.push(env.DB.prepare(`INSERT INTO billing_events (id, tenant_id, kind, detail) VALUES (?, ?, 'suspension', 'impayé — automatique')`).bind(uid('b_'), r.id));
-  }
-  stmts.push(env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(nowIso()));
-  await env.DB.batch(stmts);
-  return results.length;
+  const r = await env.DB.prepare(`UPDATE boutiques SET statut = 'suspendue' WHERE statut = 'active' AND date_echeance IS NOT NULL AND date_echeance < ?`).bind(limit).run();
+  return r.meta.changes;
 }
 
-// Lecture tolérante des formulaires (un POST sans corps ne doit pas planter)
-async function readForm(request) {
-  try { return await request.formData(); } catch { return new FormData(); }
-}
+export { DEMOS };

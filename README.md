@@ -1,84 +1,92 @@
-# Hinova Boutiques — MVP
+# Hinova Boutique Platform
 
-Générateur de boutiques en ligne multi-commerçants pour la Polynésie française.
-Un seul Worker Cloudflare sert **toutes** les boutiques : une base D1, un bucket R2, zéro serveur.
+Plateforme de boutiques en ligne pour la Polynésie française. Un seul Worker Cloudflare sert **toutes** les boutiques : une base D1, un bucket R2, aucun serveur.
 
-- Le commerçant s'inscrit, choisit sa formule, ajoute ses produits depuis son téléphone : sa boutique est en ligne.
-- Ses clients commandent et paient **directement le commerçant** (virement, espèces au guichet CCP / Marara Paiement, carte via son lien OSB/PayZen). Hinova ne touche jamais l'argent des ventes.
-- Hinova encaisse l'abonnement ; une boutique impayée passe automatiquement hors ligne.
+- **Le visiteur** arrive sur un carrousel de boutiques réelles (4 modèles). Il choisit celle qui lui plaît, se connecte avec Google, et sa boutique est créée.
+- **Le commerçant** gère tout depuis son téléphone : produits, vitrine par sections, commandes, factures, dossier OSB.
+- **Ses clients** commandent et paient **directement le commerçant** (virement, espèces au guichet CCP / Marara Paiement, carte via son lien OSB / PayZen). Hinova ne touche jamais l'argent des ventes.
+- **Hinova** encaisse l'abonnement. Une boutique impayée passe automatiquement hors ligne.
 
-## Ce que fait le MVP
+## Fonctionnalités
 
 | Module | Détail |
 |---|---|
-| Inscription / connexion | E-mail + mot de passe (PBKDF2 100 000 itérations), session 30 jours, 14 jours d'essai |
-| Formules | Mini 1 500 / Standard 4 900 / Plus 9 900 XPF par mois ; 9 / 16 / 32 produits ; 50 / 85 / 125 ventes par mois ; annuel = 10 mois payés. Tout se règle dans `src/plans.js` |
-| Tableau de bord | Étapes d'ouverture, jauges produits et ventes, CA du mois, commandes à traiter, lien de paiement de l'abonnement |
-| Produits | Ajout, modification, suppression, photo (R2, 2 Mo max), stock, visibilité ; blocage au quota |
-| Vitrine | `/s/<boutique>` ou sous-domaine `<boutique>.votre-domaine`, 3 modèles graphiques (Lagon, Sable, Nuit), mobile d'abord |
-| Commandes | Panier sur la vitrine, réservation de stock atomique, n° `CMD-AAMM-0001`, instructions de paiement, bouton WhatsApp, ventes hors quota signalées |
-| Bon de commande | Page imprimable avec **étiquette postale** (expéditeur, destinataire, île, téléphone, référence) |
-| Statuts | En attente → Payée → Expédiée / Annulée (l'annulation remet le stock) |
-| Admin Hinova | `/admin` : toutes les boutiques, revenu mensuel récurrent, encaisser +1 / +12 mois, changer de formule, suspendre / réactiver, journal de facturation |
-| Suspension auto | Tâche planifiée chaque jour : impayé + 3 jours de grâce → boutique hors ligne (page « indisponible ») |
-| Sécurité | Échappement HTML partout, contrôle d'origine sur tous les POST, cookies HttpOnly/Secure/SameSite, anti-robots sur le formulaire de commande, isolation des données par boutique dans chaque requête |
+| Accueil | Carrousel plein écran de 4 boutiques de démonstration (aperçus téléphone, glisser, flèches, clavier, lecture auto coupée au moindre geste) ; l'offre et les formules viennent ensuite |
+| Connexion | Google uniquement (`utilisateurs.email_google`) ; session signée HMAC, 30 jours ; les e-mails de `ADMIN_EMAILS` deviennent administrateurs |
+| Création | Modèle, adresse, formule, cycle ; 14 jours offerts ; sections par défaut |
+| Modèles | Lagon, Pae, Tiare, Nuit : ambiance, typographie, arrondis ; couleurs principale et secondaire, logo |
+| Sections | Bandeau, bannière, produits et commande, texte, points forts, FAQ, contact. Ordonner, masquer, modifier, ajouter (12 max). Validation stricte côté serveur |
+| Produits | Table `offres` : photo R2 (2 Mo), stock, position ; blocage au quota de la formule |
+| Commandes | Réservation de stock atomique, instructions de paiement, bon de commande + étiquette postale imprimables |
+| Factures | Numéro séquentiel par boutique (`compteurs_factures`) émis au paiement, page facture imprimable, envoi par e-mail ou WhatsApp |
+| Quotas | Ventes payées comptées par mois (`ventes_mensuelles`) ; dépassement signalé |
+| Dossier OSB | Formulaire commerçant → `dossiers_osb` + webhook `OSB_WEBHOOK_URL` ; suivi des statuts dans l'admin |
+| Admin | Boutiques, revenu mensuel récurrent, encaisser +1 / +12 mois, changer de formule, suspendre / réactiver, dossiers OSB |
+| Suspension | Tâche planifiée quotidienne : échéance dépassée + 3 jours → hors ligne |
+| Sécurité | Échappement HTML partout, contrôle d'origine sur les POST, cookies HttpOnly / Secure / SameSite, isolation par boutique dans chaque requête, redirections internes uniquement, anti-robots |
 
-## Checklist de mise en production
+Formules (`src/plans.js`) : `plan_1` Mini 1 500 XPF · 9 produits · 50 ventes ; `plan_2` Standard 4 900 · 16 · 85 ; `plan_3` Plus 9 900 · 32 · 125. Annuel = 10 mois payés.
 
-**A. Cloudflare (30 min)**
+## Mise en production
+
+**A. Google (15 min)** : Google Cloud Console → Identifiants → ID client OAuth « Application Web ».
+URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback`.
+
+**B. Cloudflare**
 1. `npm install` puis `npx wrangler login`
 2. `npx wrangler d1 create hinova_boutiques` → copier l'`database_id` dans `wrangler.toml`
 3. `npx wrangler r2 bucket create hinova-boutiques-images`
-4. `npm run db:remote` (crée les tables)
-5. `npx wrangler secret put ADMIN_TOKEN` (clé longue et aléatoire, à garder dans un gestionnaire de mots de passe)
-6. Renseigner dans `wrangler.toml` : `PAY_LINK_MINI`, `PAY_LINK_STANDARD`, `PAY_LINK_PLUS` (liens de paiement d'abonnement)
+4. `npm run db:remote` (applique `migrations/0001` puis `0002`)
+5. Secrets : `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET` (64 caractères aléatoires), et si besoin `OSB_WEBHOOK_URL`
+6. `wrangler.toml` : `ADMIN_EMAILS`, liens `PAY_LINK_PLAN_1/2/3`
 7. `npm run deploy`
 
-**B. Domaine**
-8. Route personnalisée : `boutiques.hinovadigitalcorp.com` → Worker
-9. Sous-domaines boutiques : enregistrement DNS `*.boutiques` + route `*.boutiques.hinovadigitalcorp.com/*`, puis `ROOT_DOMAIN = "boutiques.hinovadigitalcorp.com"`
+**C. Domaine**
+8. Route `boutiques.hinovadigitalcorp.com/*` → Worker
+9. Sous-domaines boutiques : DNS `*.boutiques` + route `*.boutiques.hinovadigitalcorp.com/*`, puis `ROOT_DOMAIN = "boutiques.hinovadigitalcorp.com"`. Sans cela, les boutiques sont à `/b/<adresse>`.
 
-**C. Protection**
-10. Règle de limitation de débit Cloudflare (WAF) sur `POST /connexion`, `/inscription`, `*/commander` : 10 requêtes / minute / IP
-11. Activer Turnstile sur l'inscription si des robots apparaissent
+**D. Protection** : règle de limitation de débit (WAF) sur `POST */commander` et `/demarrer`.
 
-**D. Juridique et commercial**
-12. CGU / CGV abonnement (validées par ta juriste) : hors ligne en cas d'impayé, quotas, surplus, résiliation
-13. Mentions légales et politique de confidentialité sur la page d'accueil
-14. Procédure dossier OSB : le commerçant écrit au support, tu montes le dossier, il colle son lien de paiement dans « Ma boutique »
+**E. Juridique** : CGU de l'abonnement, mentions légales, politique de confidentialité (validées par la juriste).
 
-**E. Vérification finale**
-15. Créer une vraie boutique test, passer une commande depuis un téléphone, imprimer le bon, encaisser l'abonnement dans `/admin`
-16. Lancer `npm test` contre l'URL de production : `BASE=https://... ADMIN_TOKEN=... bash test/smoke.sh`
+> Ne jamais définir `DEV_LOGIN` en production : il permet de se connecter sans Google.
 
 ## Développement local
 
 ```bash
 npm install
 npm run db:local
-echo 'ADMIN_TOKEN="dev-admin-cle-test"' > .dev.vars
-npm run dev                       # http://localhost:8787
-BASE=http://localhost:8787 npm test   # 28 vérifications de bout en bout
+cat > .dev.vars <<'EOF'
+SESSION_SECRET="dev-secret-0123456789abcdef0123456789abcdef"
+DEV_LOGIN="1"
+ADMIN_EMAILS="admin@test.pf"
+EOF
+npm run dev                            # http://localhost:8787
+BASE=http://localhost:8787 npm test    # 53 vérifications de bout en bout
 ```
-
-## Prochaines étapes (après les 10 premiers clients payants)
-
-1. **Notifications** : e-mail ou WhatsApp au commerçant à chaque commande (Cloudflare Email Workers ou fournisseur transactionnel)
-2. **Abonnement automatique** : webhook du prestataire de paiement → prolongation `paid_until` sans action manuelle
-3. **Mot de passe oublié** (lien par e-mail)
-4. **Facture automatique** au client final
-5. **Statistiques** par boutique et nom de domaine personnalisé (option payante)
 
 ## Structure
 
 ```
-schema.sql        Tables D1 : tenants, sessions, products, orders, billing_events
-wrangler.toml     Config Worker, D1, R2, tâche planifiée, variables
-src/index.js      Routage + toutes les pages (vitrine, tableau de bord, admin, cron)
-src/plans.js      Grille des formules, moyens de paiement, statuts, îles
-src/views.js      Gabarit HTML, 3 thèmes, styles
-src/lib.js        Sécurité, cookies, mots de passe, dates, formatage XPF
-test/smoke.sh     Test de bout en bout
+migrations/0001_initial_schema.sql         Schéma initial (boutiques, utilisateurs, offres, commandes, dossiers OSB, compteurs)
+migrations/0002_sections_contacts_paiements.sql  Ajouts : sections, contacts, moyens de paiement, infos de livraison
+src/index.js     Routage, connexion Google, tableau de bord, vitrines, factures, admin, tâche planifiée
+src/landing.js   Accueil en carrousel
+src/sections.js  Types de sections, validation, rendu
+src/editor.js    Éditeur de sections (navigateur)
+src/demo.js      Boutiques de démonstration
+src/plans.js     Formules, modèles, moyens de paiement, îles
+src/views.js     Gabarits application et vitrine
+src/art.js       Illustrations SVG originales (démos, produits sans photo)
+src/lib.js       Sessions signées, sécurité, dates, formatage
+test/smoke.sh    Test de bout en bout
 ```
+
+## Prochaines étapes
+
+1. Envoi automatique des factures et notifications de commande par e-mail
+2. Prolongation automatique de l'abonnement par webhook de paiement
+3. Domaine personnalisé par boutique (option payante)
+4. Statistiques de visite par boutique
 
 Hinova Digital — Heianui Tapare

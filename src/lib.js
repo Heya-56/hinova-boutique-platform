@@ -1,4 +1,4 @@
-// Utilitaires : sécurité, identifiants, réponses HTTP, dates.
+// Utilitaires : sécurité, sessions signées, réponses HTTP, dates, formatage.
 
 export function esc(v) {
   return String(v ?? '')
@@ -6,26 +6,41 @@ export function esc(v) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-export function uid(prefix = '') {
-  const b = crypto.getRandomValues(new Uint8Array(12));
-  return prefix + [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
-}
+// JSON injectable sans risque dans une balise <script type="application/json">
+export const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
 
-export function token() {
-  const b = crypto.getRandomValues(new Uint8Array(32));
-  return btoa(String.fromCharCode(...b)).replace(/[+/=]/g, (c) => ({ '+': '-', '/': '_', '=': '' }[c]));
+export function uid() {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 const enc = new TextEncoder();
-const toHex = (buf) => [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+export const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+export function b64urlDecode(s) {
+  const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+}
 
-// PBKDF2-SHA256, 100 000 itérations (maximum supporté par Workers)
-export async function hashPassword(password, saltHex) {
-  const salt = saltHex || toHex(crypto.getRandomValues(new Uint8Array(16)));
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(salt), iterations: 100000 }, key, 256);
-  return { hash: toHex(bits), salt };
+async function hmacKey(secret) {
+  return crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+// Jeton signé HMAC-SHA256 : base64url(payload).base64url(signature)
+export async function sign(payload, secret) {
+  const body = b64url(enc.encode(JSON.stringify(payload)));
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), enc.encode(body));
+  return `${body}.${b64url(sig)}`;
+}
+
+export async function verify(tok, secret) {
+  if (!tok || !secret || !tok.includes('.')) return null;
+  const [body, sig] = tok.split('.');
+  try {
+    const ok = await crypto.subtle.verify('HMAC', await hmacKey(secret), b64urlDecode(sig), enc.encode(body));
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(b64urlDecode(body)));
+    if (p.x && p.x < Date.now()) return null;
+    return p;
+  } catch { return null; }
 }
 
 export function safeEqual(a, b) {
@@ -36,75 +51,78 @@ export function safeEqual(a, b) {
 }
 
 export function slugify(s) {
-  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
 }
+export const RESERVED = new Set(['admin', 'api', 'www', 'app', 'support', 'hinova', 'img', 'static', 'demo', 'auth', 'b', 'f', 'mail']);
 
-export const RESERVED_SLUGS = new Set(['admin', 'api', 'www', 'app', 'support', 'hinova', 'img', 's', 'static']);
-
+const BASE_HEADERS = {
+  'content-type': 'text/html; charset=utf-8',
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'x-frame-options': 'DENY',
+};
 export function html(body, status = 200, headers = {}) {
-  return new Response(body, {
-    status,
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      'x-content-type-options': 'nosniff',
-      'referrer-policy': 'strict-origin-when-cross-origin',
-      'x-frame-options': 'DENY',
-      ...headers,
-    },
-  });
+  return new Response(body, { status, headers: { ...BASE_HEADERS, ...headers } });
 }
-
 export function redirect(location, headers = {}) {
   return new Response(null, { status: 303, headers: { location, ...headers } });
 }
+export const withMsg = (path, key, msg) => `${path}${path.includes('?') ? '&' : '?'}${key}=${encodeURIComponent(msg)}`;
 
 export function getCookie(request, name) {
-  const raw = request.headers.get('cookie') || '';
-  for (const part of raw.split(';')) {
+  for (const part of (request.headers.get('cookie') || '').split(';')) {
     const [k, ...v] = part.trim().split('=');
     if (k === name) return decodeURIComponent(v.join('='));
   }
   return null;
 }
-
 export function setCookie(name, value, maxAge) {
   return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 }
 
-// Protection CSRF : un POST doit venir de notre propre origine.
+// Protection CSRF : un POST doit venir de notre propre origine (cookies SameSite=Lax en complément).
 export function sameOrigin(request) {
   const origin = request.headers.get('origin');
-  if (!origin) return true; // certains navigateurs omettent Origin sur les formulaires same-origin ; cookie SameSite=Lax couvre ce cas
+  if (!origin) return true;
   try { return new URL(origin).host === new URL(request.url).host; } catch { return false; }
 }
 
+export async function readForm(request) {
+  try { return await request.formData(); } catch { return new FormData(); }
+}
+
+// Redirections internes uniquement (pas de //domaine ni d'URL absolue)
+export const safeNext = (n) => (typeof n === 'string' && n.startsWith('/') && !n.startsWith('//') && !n.startsWith('/\\') ? n : '/tableau-de-bord');
+
 export const nowIso = () => new Date().toISOString();
 export const addDays = (d, n) => new Date(new Date(d).getTime() + n * 86400000).toISOString();
-export const addMonths = (d, n) => { const x = new Date(d); x.setUTCMonth(x.getUTCMonth() + n); return x.toISOString(); };
+export function addMonths(d, n) { const x = new Date(d); x.setUTCMonth(x.getUTCMonth() + n); return x.toISOString(); }
+
+// Heure de Tahiti (UTC-10, pas d'heure d'été)
+const tahiti = () => new Date(Date.now() - 10 * 3600000);
+export const monthKey = () => tahiti().toISOString().slice(0, 7); // YYYY-MM
+export const yearKey = () => tahiti().toISOString().slice(0, 4);
+export function monthStartSql() {
+  const t = tahiti();
+  return new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), 1) + 10 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
+}
 
 export function fmtXpf(n) {
   return new Intl.NumberFormat('fr-FR').format(Number(n) || 0).replace(/[\s\u202f\u00a0]/g, '\u00a0') + '\u00a0XPF';
 }
-
 export function fmtDate(iso) {
-  if (!iso) return '';
-  return new Date(iso.replace(' ', 'T') + (iso.includes('Z') || iso.includes('+') ? '' : 'Z'))
-    .toLocaleDateString('fr-FR', { timeZone: 'Pacific/Tahiti', day: '2-digit', month: '2-digit', year: 'numeric' });
-}
-
-// Début du mois courant (heure de Tahiti) au format SQLite, pour compter les ventes du mois
-export function monthStartSql() {
-  const t = new Date(Date.now() - 10 * 3600000); // UTC-10
-  const start = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), 1) + 10 * 3600000;
-  return new Date(start).toISOString().replace('T', ' ').slice(0, 19);
+  if (!iso) return '—';
+  const s = String(iso);
+  const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+  return d.toLocaleDateString('fr-FR', { timeZone: 'Pacific/Tahiti', day: '2-digit', month: '2-digit', year: 'numeric' });
 }
 
 export function int(v, def = 0) {
   const n = parseInt(String(v ?? '').replace(/\s/g, ''), 10);
   return Number.isFinite(n) ? n : def;
 }
-
-export function clean(v, max = 500) {
-  return String(v ?? '').trim().slice(0, max);
-}
+export const clean = (v, max = 500) => String(v ?? '').trim().slice(0, max);
+export const isHttps = (v) => /^https:\/\/[^\s<>"']+$/.test(v);
+export const isColor = (v) => /^#[0-9a-fA-F]{6}$/.test(v);
+export const isEmail = (v) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v);
