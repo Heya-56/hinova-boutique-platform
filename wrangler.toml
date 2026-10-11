@@ -1,0 +1,29 @@
+name = "hinova-boutiques"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Suspension automatique des boutiques impayées : tous les jours à 6h (heure de Tahiti = 16h UTC)
+[triggers]
+crons = ["0 16 * * *"]
+
+[vars]
+BRAND = "Hinova Boutiques"
+SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
+# Domaine racine pour les sous-domaines (ex. maboutique.boutiques.hinovadigitalcorp.com). Vide = adresses /s/<slug> uniquement.
+ROOT_DOMAIN = ""
+TRIAL_DAYS = "14"
+GRACE_DAYS = "3"
+# Liens de paiement d'abonnement (Stripe ou autre) affichés au commerçant — à renseigner
+PAY_LINK_MINI = ""
+PAY_LINK_STANDARD = ""
+PAY_LINK_PLUS = ""
+# Secret à définir avec : npx wrangler secret put ADMIN_TOKEN
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hinova_boutiques"
+database_id = "REMPLACER_PAR_ID_D1"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "hinova-boutiques-images"
