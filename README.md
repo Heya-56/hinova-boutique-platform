@@ -14,7 +14,10 @@ Plateforme de boutiques en ligne pour la Polynésie française. Un seul Worker C
 | Générateur IA | Le visiteur décrit son activité en une phrase : Workers AI (Llama 3.3 70B, sortie JSON) propose nom, modèle, couleurs, textes, sections et 4 à 6 produits ; aperçu en direct dans un téléphone ; la boutique créée reprend tout. Si l'IA est indisponible ou lente (15 s), une proposition automatique par mots-clés prend le relais, annoncée comme telle |
 | Accueil | Look « IA / tech » : générateur en tête, carrousel des 4 modèles, étapes, formules |
 | Panier | Bouton « Ajouter au panier », compteur, panneau latéral (quantités, total, coordonnées et validation), mémorisé sur le téléphone ; sans JavaScript, la commande classique reste disponible |
-| Connexion | Google uniquement (`utilisateurs.email_google`) ; session signée HMAC, 30 jours ; les e-mails de `ADMIN_EMAILS` deviennent administrateurs |
+| Inscription payante | Formulaire unique (boutique, formule, mensuel ou annuel payé comptant, e-mail et mot de passe) → Stripe Checkout (abonnement XPF) → retour `/bienvenue` : l'espace est créé et le commerçant connecté. Le webhook signé crée aussi l'espace si le navigateur est fermé, prolonge l'échéance à chaque renouvellement, suspend en cas de résiliation et suit les changements de formule |
+| Connexion | E-mail + mot de passe (PBKDF2), Google en option ; session signée HMAC, 30 jours ; secret de session et secret du webhook rangés dans la table `config` |
+| Abonnement | Bouton « Gérer mon abonnement » : portail client Stripe (carte, factures, changement de formule, résiliation) |
+| Admin | Premier accès par lien à usage unique `/admin/init?code=…` (code dans `config.admin_init_code`) |
 | Création | Modèle, adresse, formule, cycle ; 14 jours offerts ; sections par défaut |
 | Modèles | Lagon, Pae, Tiare, Nuit : ambiance, typographie, arrondis ; couleurs principale et secondaire, logo |
 | Sections | Bandeau, bannière, produits et commande, texte, points forts, FAQ, contact. Ordonner, masquer, modifier, ajouter (12 max). Validation stricte côté serveur |
@@ -39,8 +42,8 @@ URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback
 2. `npx wrangler d1 create hinova_boutiques` → copier l'`database_id` dans `wrangler.toml`
 3. `npx wrangler r2 bucket create hinova-boutiques-images`
 4. `npm run db:remote` (applique `migrations/0001` puis `0002`)
-5. Secrets : `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET` (64 caractères aléatoires), et si besoin `OSB_WEBHOOK_URL`
-6. `wrangler.toml` : `ADMIN_EMAILS`, liens `PAY_LINK_PLAN_1/2/3`
+5. Secret obligatoire pour encaisser : `STRIPE_SECRET_KEY` (clé secrète ou clé restreinte Stripe). Facultatifs : `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OSB_WEBHOOK_URL`
+6. `wrangler.toml` : `ADMIN_EMAILS` et les 6 prix `STRIPE_PRICE_*` (déjà renseignés). Webhook Stripe : `https://<app>/api/stripe/webhook` (événements checkout.session.completed, invoice.paid, invoice.payment_failed, customer.subscription.updated, customer.subscription.deleted)
 7. `npm run deploy`
 
 **C. Domaine**
@@ -66,7 +69,7 @@ DEV_LOGIN="1"
 ADMIN_EMAILS="admin@test.pf"
 EOF
 npm run dev                            # http://localhost:8787 (environnement « test », sans Workers AI : la proposition automatique est utilisée)
-BASE=http://localhost:8787 npm test    # 64 vérifications de bout en bout
+BASE=http://localhost:8787 npm test    # 76 vérifications de bout en bout
 ```
 
 ## Structure
@@ -74,9 +77,12 @@ BASE=http://localhost:8787 npm test    # 64 vérifications de bout en bout
 ```
 migrations/0001_initial_schema.sql         Schéma initial (boutiques, utilisateurs, offres, commandes, dossiers OSB, compteurs)
 migrations/0002_sections_contacts_paiements.sql  Ajouts : sections, contacts, moyens de paiement, infos de livraison
+migrations/0003_comptes_et_abonnements_stripe.sql Comptes e-mail, inscriptions en attente de paiement, liens Stripe, configuration
 src/index.js     Routage, connexion Google, tableau de bord, vitrines, factures, admin, tâche planifiée
 src/landing.js   Accueil : générateur IA et carrousel
 src/ai.js        Génération par Workers AI et proposition automatique de secours
+src/stripe.js    Abonnements Stripe : Checkout, portail client, webhook signé
+src/photos.js    Photos d'exemple libres de droits (Pexels)
 src/sections.js  Types de sections, validation, rendu
 src/editor.js    Éditeur de sections (navigateur)
 src/demo.js      Boutiques de démonstration

@@ -126,3 +126,11 @@ export const clean = (v, max = 500) => String(v ?? '').trim().slice(0, max);
 export const isHttps = (v) => /^https:\/\/[^\s<>"']+$/.test(v);
 export const isColor = (v) => /^#[0-9a-fA-F]{6}$/.test(v);
 export const isEmail = (v) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v);
+
+// Mot de passe : PBKDF2-SHA256, 100 000 itérations (maximum accepté par Workers), sel aléatoire
+export async function hashPassword(password, saltHex) {
+  const salt = saltHex || [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, '0')).join('');
+  const key = await crypto.subtle.importKey('raw', enc.encode(String(password)), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(salt), iterations: 100000 }, key, 256);
+  return { hash: [...new Uint8Array(bits)].map((x) => x.toString(16).padStart(2, '0')).join(''), salt };
+}

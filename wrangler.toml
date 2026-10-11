@@ -15,11 +15,16 @@ TRIAL_DAYS = "14"
 GRACE_DAYS = "3"
 # Adresses Google qui deviennent administratrices à leur première connexion (séparées par des virgules)
 ADMIN_EMAILS = "heianui.tapare@hinovadigitalcorp.com"
-# Liens de paiement des abonnements, affichés au commerçant
-PAY_LINK_PLAN_1 = ""
-PAY_LINK_PLAN_2 = ""
-PAY_LINK_PLAN_3 = ""
-# Secrets (npx wrangler secret put …) : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SESSION_SECRET, OSB_WEBHOOK_URL (optionnel)
+# Prix Stripe des abonnements (compte Hinova Digital, XPF). Le paiement s'active dès que le secret STRIPE_SECRET_KEY est ajouté.
+STRIPE_PRICE_PLAN_1_MENSUEL = "price_1UPSt7CVrYZbi1ZGTXRNPxD0"
+STRIPE_PRICE_PLAN_1_ANNUEL = "price_1UPSt9CVrYZbi1ZGs2r5pMPW"
+STRIPE_PRICE_PLAN_2_MENSUEL = "price_1UPStACVrYZbi1ZG8bFqdeE6"
+STRIPE_PRICE_PLAN_2_ANNUEL = "price_1UPStCCVrYZbi1ZGWMbzWui5"
+STRIPE_PRICE_PLAN_3_MENSUEL = "price_1UPStECVrYZbi1ZGhEXLuKU7"
+STRIPE_PRICE_PLAN_3_ANNUEL = "price_1UPStFCVrYZbi1ZG47vRMHqJ"
+# Secrets (tableau de bord Cloudflare ou npx wrangler secret put …) : STRIPE_SECRET_KEY (obligatoire pour encaisser),
+# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET (connexion Google, facultative), OSB_WEBHOOK_URL (facultatif).
+# Le secret de session et le secret du webhook Stripe sont rangés dans la table config de la base.
 # Ne JAMAIS définir DEV_LOGIN en production (connexion de test sans Google, réservée au poste local).
 
 [[d1_databases]]

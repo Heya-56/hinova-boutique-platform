@@ -255,7 +255,7 @@ export function landingPage(env) {
 <section class="sec" id="formules"><div class="in">
   <div class="kick">// formules</div>
   <h2>Un abonnement simple</h2>
-  <p class="lead2">${esc(env.TRIAL_DAYS || '14')} jours offerts, sans engagement.</p>
+  <p class="lead2">Paiement sécurisé par carte · mensuel, ou annuel payé comptant avec 2 mois offerts · résiliable à tout moment.</p>
   <div class="cards">${plans}</div>
   <p class="lead2" style="margin-top:18px;font-size:.9rem">Plus de produits ou un site sur mesure ? <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a></p>
 </div></section>

@@ -1,9 +1,9 @@
 // Hinova Boutique Platform — Worker mutualisé : accueil, vitrines, tableau de bord commerçant, admin Hinova.
-// Schéma : migrations/0001 (initial) + 0002 (sections, contacts, paiements).
+// Schéma : migrations/0001 (initial) + 0002 (sections, contacts, paiements) + 0003 (comptes, inscriptions, Stripe).
 import {
   esc, jsonForScript, uid, b64urlDecode, sign, verify, slugify, RESERVED, html, redirect, withMsg,
   getCookie, setCookie, sameOrigin, readForm, safeNext, nowIso, addDays, addMonths, monthKey, yearKey, monthStartSql,
-  fmtXpf, fmtDate, int, clean, isHttps, isColor, isEmail,
+  fmtXpf, fmtDate, int, clean, isHttps, isColor, isEmail, safeEqual, hashPassword,
 } from './lib.js';
 import {
   PLANS, getPlan, annualPrice, MODELES, getModele, PAYMENT_METHODS, ORDER_STATUSES, NEXT_STATUS, BANQUES, OSB_STATUTS, ISLANDS,
@@ -16,6 +16,9 @@ import { EDITOR_JS, EDITOR_CSS } from './editor.js';
 import { landingPage } from './landing.js';
 import { generateShop, fallbackGen, encodeGen, decodeGen } from './ai.js';
 import { productPhoto } from './photos.js';
+import {
+  stripeReady, priceFor, createCheckout, getCheckout, getSubscription, createPortal, periodEnd, invoicePeriodEnd, invoiceSubscription, invoiceMetadata, verifyWebhook,
+} from './stripe.js';
 
 const SESSION = 'hb_s';
 const OAUTH = 'hb_oauth';
@@ -67,13 +70,20 @@ async function route(request, env) {
   }
   if (parts[0] === 'f' && parts[1]) return invoicePage(env, parts[1]);
 
-  if (p === '/connexion') return loginPage(env, url);
+  if (p === '/connexion') return method === 'POST' ? loginPost(request, env) : loginPage(env, url);
+  if (p === '/bienvenue') return welcome(request, env, url);
+  if (p === '/api/stripe/webhook' && method === 'POST') return stripeWebhook(request, env);
+  if (p === '/admin/init') return adminInit(request, env, url);
   if (p === '/auth/google') return googleStart(request, env, url);
   if (p === '/auth/google/callback') return googleCallback(request, env, url);
   if (p === '/auth/dev') return devLogin(request, env, url);
   if (p === '/deconnexion') return redirect('/', { 'set-cookie': setCookie(SESSION, '', 0) });
 
-  if (p === '/demarrer') return method === 'POST' ? onboardingPost(request, env, url) : onboardingForm(request, env, url);
+  if (p === '/demarrer') {
+    const who = await currentUser(request, env);
+    if (who?.user) return redirect(who.user.role === 'admin' ? '/admin' : '/tableau-de-bord');
+    return method === 'POST' ? onboardingPost(request, env, url) : onboardingForm(request, env, url);
+  }
 
   if (parts[0] === 'tableau-de-bord') {
     const who = await currentUser(request, env);
@@ -97,53 +107,89 @@ async function route(request, env) {
 
 const notFound = () => html(appPage({ title: 'Page introuvable', body: '<div class="card"><h1>Page introuvable</h1><p><a href="/">Retour à l’accueil</a></p></div>' }), 404);
 
-// ───────────────────────────── Authentification Google ─────────────────────────────
+// ───────────────────────────── Comptes et sessions ─────────────────────────────
 
-// Sans SESSION_SECRET (ou Google non configuré), le site reste en ligne : seules les connexions sont fermées.
-const secretOk = (env) => !!env.SESSION_SECRET && env.SESSION_SECRET.length >= 32;
-const loginReady = (env) => secretOk(env) && (!!env.GOOGLE_CLIENT_ID || env.DEV_LOGIN === '1');
-const CLOSED = 'Les comptes commerçants ouvrent très bientôt. Laissez-nous votre contact pour être prévenu(e).';
+// Secret de session : variable SESSION_SECRET si présente, sinon secret généré une fois et gardé en base (table config).
+let SECRET_CACHE = null;
+async function sessionSecret(env) {
+  if (env.SESSION_SECRET && env.SESSION_SECRET.length >= 32) return env.SESSION_SECRET;
+  if (SECRET_CACHE) return SECRET_CACHE;
+  try {
+    let row = await env.DB.prepare(`SELECT valeur FROM config WHERE cle = 'session_secret'`).first();
+    if (!row) {
+      await env.DB.prepare(`INSERT OR IGNORE INTO config (cle, valeur) VALUES ('session_secret', ?)`).bind(uid() + uid()).run();
+      row = await env.DB.prepare(`SELECT valeur FROM config WHERE cle = 'session_secret'`).first();
+    }
+    SECRET_CACHE = row?.valeur || null;
+  } catch (e) { console.error('Secret de session indisponible :', e && e.message); }
+  return SECRET_CACHE;
+}
+
+async function configValue(env, cle) {
+  try { return (await env.DB.prepare('SELECT valeur FROM config WHERE cle = ?').bind(cle).first())?.valeur || null; } catch { return null; }
+}
 
 async function currentUser(request, env) {
-  if (!secretOk(env)) return null;
-  const s = await verify(getCookie(request, SESSION), env.SESSION_SECRET);
+  const secret = await sessionSecret(env);
+  if (!secret) return null;
+  const s = await verify(getCookie(request, SESSION), secret);
   if (!s?.e) return null;
   const user = await env.DB.prepare('SELECT * FROM utilisateurs WHERE email_google = ?').bind(s.e).first();
   return { email: s.e, user };
 }
 
+async function sessionCookie(env, email) {
+  const tok = await sign({ e: email.toLowerCase(), x: Date.now() + SESSION_DAYS * 86400000 }, await sessionSecret(env));
+  return setCookie(SESSION, tok, SESSION_DAYS * 86400);
+}
+
 async function openSession(env, email, next) {
-  if (!secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
   const e = email.toLowerCase();
   const admins = String(env.ADMIN_EMAILS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
   if (admins.includes(e)) await env.DB.prepare(`INSERT OR IGNORE INTO utilisateurs (email_google, role) VALUES (?, 'admin')`).bind(e).run();
-  const tok = await sign({ e, x: Date.now() + SESSION_DAYS * 86400000 }, env.SESSION_SECRET);
-  return redirect(safeNext(next), { 'set-cookie': setCookie(SESSION, tok, SESSION_DAYS * 86400) });
+  return redirect(safeNext(next), { 'set-cookie': await sessionCookie(env, e) });
 }
 
 function loginPage(env, url) {
   const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
+  const google = env.GOOGLE_CLIENT_ID ? `<p class="small muted" style="margin:18px 0 6px">ou</p>
+    <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>` : '';
   const dev = env.DEV_LOGIN === '1' ? `<form method="get" action="/auth/dev" class="card" style="margin-top:16px;border-style:dashed">
       <p class="small muted">Mode développement (désactivé en production)</p><input type="hidden" name="next" value="${esc(next)}">
       <label for="de">E-mail de test</label><input id="de" name="email" type="email" required><button class="btn small" style="margin-top:10px">Connexion test</button></form>` : '';
-  const ready = loginReady(env) && !!env.GOOGLE_CLIENT_ID;
-  const main = ready
-    ? `<h1>Connexion</h1><p class="muted">Un seul compte Google pour gérer votre boutique, sans mot de passe à retenir.</p>
-    <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>`
-    : `<h1>Bientôt disponible</h1><p class="muted">${CLOSED}</p>
-    <a class="btn" href="mailto:${esc(env.SUPPORT_EMAIL)}?subject=${encodeURIComponent('Je veux ma boutique Hinova')}">Être prévenu(e)</a>
-    <p class="small"><a href="/">← Revenir au générateur</a></p>`;
-  const body = `<div style="max-width:440px;margin:30px auto">${ready ? flash(url) : ''}<div class="card" style="text-align:center">${main}</div>${secretOk(env) ? dev : ''}</div>`;
+  const body = `<div style="max-width:440px;margin:30px auto">${flash(url)}<div class="card">
+    <h1>Connexion</h1><p class="muted">Accédez à l’espace de gestion de votre boutique.</p>
+    <form method="post" action="/connexion">
+      <input type="hidden" name="next" value="${esc(next)}">
+      <label for="em">E-mail</label><input id="em" name="email" type="email" required autocomplete="email">
+      <label for="pw">Mot de passe</label><input id="pw" name="password" type="password" required autocomplete="current-password">
+      <button class="btn" type="submit" style="width:100%">Se connecter</button>
+    </form>${google}
+    <p class="small muted" style="margin-top:16px">Pas encore de boutique ? <a href="/">Générer la mienne</a></p></div>${dev}</div>`;
   return html(appPage({ title: 'Connexion', body }));
+}
+
+async function loginPost(request, env) {
+  const f = await readForm(request);
+  const email = clean(f.get('email'), 120).toLowerCase();
+  const password = String(f.get('password') || '');
+  const next = safeNext(String(f.get('next') || '/tableau-de-bord'));
+  const u = await env.DB.prepare('SELECT * FROM utilisateurs WHERE email_google = ?').bind(email).first();
+  // Un hachage est toujours calculé pour ne pas révéler l'existence d'un compte par le temps de réponse
+  const { hash } = await hashPassword(password, u?.sel || 'sel-leurre-constant');
+  if (!u || !u.mot_de_passe || !safeEqual(hash, u.mot_de_passe)) {
+    return redirect(withMsg('/connexion?next=' + encodeURIComponent(next), 'err', 'E-mail ou mot de passe incorrect.'));
+  }
+  return redirect(u.role === 'admin' && next === '/tableau-de-bord' ? '/admin' : next, { 'set-cookie': await sessionCookie(env, email) });
 }
 
 const GOOGLE_G = '<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.5l6.7-6.7C35.6 2.4 30.2 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.8 6C12.4 13.6 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.4 5.7c4.3-4 6.9-9.9 6.9-17z"/><path fill="#FBBC05" d="M10.5 28.7A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.7l-7.8-6A24 24 0 0 0 0 24c0 3.9.9 7.5 2.6 10.7l7.9-6z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.4-5.7c-2.1 1.4-4.8 2.3-8.5 2.3-6.3 0-11.6-4.2-13.5-9.9l-7.9 6C6.6 42.6 14.6 48 24 48z"/></svg>';
 
 async function googleStart(request, env, url) {
-  if (!env.GOOGLE_CLIENT_ID || !secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
+  if (!env.GOOGLE_CLIENT_ID) return redirect('/connexion');
   const state = uid();
   const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
-  const cookie = await sign({ s: state, n: next, x: Date.now() + 600000 }, env.SESSION_SECRET);
+  const cookie = await sign({ s: state, n: next, x: Date.now() + 600000 }, await sessionSecret(env));
   const q = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID, redirect_uri: `${url.origin}/auth/google/callback`, response_type: 'code',
     scope: 'openid email', state, prompt: 'select_account',
@@ -152,8 +198,7 @@ async function googleStart(request, env, url) {
 }
 
 async function googleCallback(request, env, url) {
-  if (!secretOk(env)) return redirect(withMsg('/connexion', 'err', CLOSED));
-  const saved = await verify(getCookie(request, OAUTH), env.SESSION_SECRET);
+  const saved = await verify(getCookie(request, OAUTH), await sessionSecret(env));
   const fail = (m) => redirect(withMsg('/connexion', 'err', m), { 'set-cookie': setCookie(OAUTH, '', 0) });
   if (!saved || saved.s !== url.searchParams.get('state')) return fail('Session de connexion expirée, réessayez.');
   const code = url.searchParams.get('code');
@@ -164,7 +209,6 @@ async function googleCallback(request, env, url) {
   });
   if (!res.ok) return fail('Google a refusé la connexion.');
   const { id_token } = await res.json();
-  // Jeton reçu directement de Google en HTTPS : on contrôle l'audience, l'émetteur, l'expiration et la vérification de l'e-mail.
   let c;
   try { c = JSON.parse(new TextDecoder().decode(b64urlDecode(id_token.split('.')[1]))); } catch { return fail('Réponse Google illisible.'); }
   if (c.aud !== env.GOOGLE_CLIENT_ID || !['accounts.google.com', 'https://accounts.google.com'].includes(c.iss) || c.exp * 1000 < Date.now() || !c.email_verified || !c.email) {
@@ -182,85 +226,259 @@ async function devLogin(request, env, url) {
   return openSession(env, email, url.searchParams.get('next') || '/tableau-de-bord');
 }
 
-// ───────────────────────────── Création de boutique ─────────────────────────────
+// Premier accès administrateur : code à usage unique rangé en base (config.admin_init_code), puis supprimé.
+async function adminInit(request, env, url) {
+  const code = await configValue(env, 'admin_init_code');
+  const given = String(url.searchParams.get('code') || '');
+  if (!code || !safeEqual(given, code)) return notFound();
+  const admins = String(env.ADMIN_EMAILS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+  if (request.method === 'POST') {
+    const f = await readForm(request);
+    const email = clean(f.get('email'), 120).toLowerCase();
+    const pw = String(f.get('password') || '');
+    if (!admins.includes(email)) return redirect(withMsg(`/admin/init?code=${encodeURIComponent(given)}`, 'err', 'Cet e-mail n’est pas un e-mail administrateur.'));
+    if (pw.length < 10) return redirect(withMsg(`/admin/init?code=${encodeURIComponent(given)}`, 'err', 'Mot de passe : 10 caractères minimum.'));
+    const { hash, salt } = await hashPassword(pw);
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO utilisateurs (email_google, role, mot_de_passe, sel) VALUES (?, 'admin', ?, ?)
+        ON CONFLICT(email_google) DO UPDATE SET role = 'admin', boutique_id = NULL, mot_de_passe = excluded.mot_de_passe, sel = excluded.sel`).bind(email, hash, salt),
+      env.DB.prepare(`DELETE FROM config WHERE cle = 'admin_init_code'`),
+    ]);
+    return redirect('/admin', { 'set-cookie': await sessionCookie(env, email) });
+  }
+  const body = `<div class="card" style="max-width:440px;margin:30px auto">${flash(url)}<h1>Accès administrateur</h1>
+    <p class="muted">Créez le mot de passe de l’administration. Ce lien ne fonctionne qu’une fois.</p>
+    <form method="post"><label for="em">E-mail administrateur</label><input id="em" name="email" type="email" required>
+    <label for="pw">Mot de passe (10 caractères minimum)</label><input id="pw" name="password" type="password" minlength="10" required autocomplete="new-password">
+    <button class="btn" type="submit">Valider</button></form></div>`;
+  return html(appPage({ title: 'Accès administrateur', body }), 200, { 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
+}
 
-async function onboardingForm(request, env, url, values = {}) {
-  const who = await currentUser(request, env);
+// ───────────────────────────── Inscription et paiement ─────────────────────────────
+
+function onboardingForm(request, env, url, values = {}) {
   const modele = MODELES[values.modele || url.searchParams.get('modele')] ? (values.modele || url.searchParams.get('modele')) : 'lagon';
   const plan = PLANS[values.plan || url.searchParams.get('plan')] ? (values.plan || url.searchParams.get('plan')) : 'plan_1';
+  const cycle = (values.cycle || url.searchParams.get('cycle')) === 'annuel' ? 'annuel' : 'mensuel';
   const gRaw = values.g || url.searchParams.get('g') || '';
   const gen = decodeGen(gRaw);
-  if (gen && !values.nom) { values.nom = gen.nom; values.modele = gen.modele; }
-  const modeleSel = gen ? gen.modele : modele;
-  if (!who) {
-    const next = `/demarrer?modele=${modeleSel}&plan=${plan}${gen ? '&g=' + gRaw : ''}`;
-    const body = `<div style="max-width:480px;margin:30px auto" class="card"><h1>Créer ma boutique</h1>
-      <p>${gen ? `Votre boutique <b>${esc(gen.nom)}</b> est prête à être créée.` : `Modèle choisi : <b>${esc(getModele(modele).label)}</b>.`}${loginReady(env) ? ' Connectez-vous avec Google pour continuer : c’est votre compte de gestion.' : ''}</p>
-      ${loginReady(env) ? `<a class="btn google" href="/connexion?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>`
-        : `<p class="flash ok">${CLOSED}</p><a class="btn" href="mailto:${esc(env.SUPPORT_EMAIL)}?subject=${encodeURIComponent('Je veux ma boutique ' + (gen ? gen.nom : 'Hinova'))}">Être prévenu(e)</a>`}
-      <p class="small muted"><a href="/">← Revenir au générateur</a></p></div>`;
-    return html(appPage({ title: 'Créer ma boutique', body }));
-  }
-  if (who.user?.role === 'admin') return redirect('/admin');
-  if (who.user) return redirect('/tableau-de-bord');
+  if (gen && !values.nom) { values.nom = gen.nom === 'Ma boutique' ? '' : gen.nom; }
+  const modeleSel = values.modele || (gen ? gen.modele : modele);
+  const pay = stripeReady(env);
   const suffix = env.ROOT_DOMAIN ? `.${esc(env.ROOT_DOMAIN)}` : '';
-  const body = `<div class="card" style="max-width:640px;margin:0 auto">
-    <h1>Créer ma boutique</h1>${flash(url)}
-    <p class="muted small">Connecté avec ${esc(who.email)} · <a href="/deconnexion">changer de compte</a></p>
-    ${gen ? `<p class="flash ok">Votre boutique générée (${gen.offres.length} produits, textes et sections) sera reprise telle quelle : vous pourrez tout modifier ensuite.</p>` : ''}
-    <form method="post">
+  const cancelled = url.searchParams.get('annule') ? '<div class="flash err">Paiement annulé : aucune somme n’a été prélevée. Vous pouvez recommencer.</div>' : '';
+  const prices = Object.fromEntries(Object.values(PLANS).map((p) => [p.key, { m: p.monthly, a: annualPrice(p) }]));
+  const body = `<div class="card" style="max-width:660px;margin:0 auto">
+    <h1>Créer ma boutique</h1>${flash(url)}${cancelled}
+    ${gen ? `<p class="flash ok">Votre boutique générée (${gen.offres.length} produits, textes et sections) est reprise telle quelle : vous pourrez tout modifier ensuite.</p>` : ''}
+    <form method="post" id="signup">
       ${gen ? `<input type="hidden" name="g" value="${esc(gRaw)}">` : ''}
+      <h2 style="margin-top:8px">1. Votre boutique</h2>
       <label for="nom">Nom de la boutique</label><input id="nom" name="nom" required maxlength="60" value="${esc(values.nom)}">
       <label for="sd">Adresse de la boutique</label><input id="sd" name="sous_domaine" maxlength="40" placeholder="ex. te-mira" value="${esc(values.sous_domaine)}">
-      <p class="small muted">Votre boutique sera à l’adresse <b>${env.ROOT_DOMAIN ? 'nom' + suffix : '/b/nom'}</b>. Lettres, chiffres et tirets ; laissez vide pour la créer depuis le nom.</p>
+      <p class="small muted">Adresse : <b>${env.ROOT_DOMAIN ? 'nom' + suffix : '/b/nom'}</b>. Lettres, chiffres et tirets ; laissez vide pour la créer depuis le nom.</p>
       <label>Modèle</label>
       <div class="modeles">${Object.entries(MODELES).map(([k, m]) => `<label><input type="radio" name="modele" value="${k}" ${k === modeleSel ? 'checked' : ''}> ${m.label}
         <div class="swatch"><i style="background:${m.tokens.bg}"></i><i style="background:${m.primary}"></i><i style="background:${m.secondary}"></i></div></label>`).join('')}</div>
-      <div class="row">
-        <div><label for="plan">Formule</label><select id="plan" name="plan">${Object.values(PLANS).map((pl) => `<option value="${pl.key}" ${pl.key === plan ? 'selected' : ''}>${esc(pl.label)} — ${fmtXpf(pl.monthly)}/mois · ${pl.maxProducts} produits</option>`).join('')}</select></div>
-        <div><label for="cycle">Facturation</label><select id="cycle" name="cycle"><option value="mensuel">Mensuelle</option><option value="annuel" ${values.cycle === 'annuel' ? 'selected' : ''}>Annuelle (2 mois offerts)</option></select></div>
+      <h2 style="margin-top:24px">2. Votre formule</h2>
+      <div class="modeles">${Object.values(PLANS).map((pl) => `<label><input type="radio" name="plan" value="${pl.key}" ${pl.key === plan ? 'checked' : ''}> <b>${esc(pl.label)}</b>
+        <div class="small muted">${pl.maxProducts} produits · ${pl.salesQuota} ventes / mois<br>${fmtXpf(pl.monthly)} / mois</div></label>`).join('')}</div>
+      <div class="modeles" style="margin-top:10px">
+        <label><input type="radio" name="cycle" value="mensuel" ${cycle === 'mensuel' ? 'checked' : ''}> <b>Mensuel</b><div class="small muted">Prélevé chaque mois, résiliable à tout moment</div></label>
+        <label><input type="radio" name="cycle" value="annuel" ${cycle === 'annuel' ? 'checked' : ''}> <b>Annuel, payé comptant</b><div class="small muted">Une fois par an · 2 mois offerts</div></label>
       </div>
-      <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start"><input type="checkbox" name="cgu" required style="margin-top:5px"> J’accepte les conditions générales. En cas d’abonnement impayé, la boutique est mise hors ligne jusqu’à régularisation.</label>
-      <button class="btn" type="submit">Créer ma boutique — ${esc(env.TRIAL_DAYS || '14')} jours offerts</button>
-    </form></div>`;
-  return html(appPage({ title: 'Créer ma boutique', body }));
+      <p class="flash ok" id="total" style="margin-top:12px"></p>
+      <h2 style="margin-top:24px">3. Votre compte</h2>
+      <div class="row">
+        <div><label for="em">E-mail</label><input id="em" name="email" type="email" required maxlength="120" autocomplete="email" value="${esc(values.email)}"></div>
+        <div><label for="pw">Mot de passe (8 caractères minimum)</label><input id="pw" name="password" type="password" minlength="8" required autocomplete="new-password"></div>
+      </div>
+      <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start;margin-top:16px"><input type="checkbox" name="cgu" required style="margin-top:5px"> J’accepte les conditions générales. L’abonnement est renouvelé automatiquement ; en cas d’impayé, la boutique est mise hors ligne jusqu’à régularisation.</label>
+      <button class="btn" type="submit" style="width:100%">${pay ? 'Payer par carte et créer ma boutique' : 'Créer ma boutique'}</button>
+      ${pay ? '<p class="small muted" style="text-align:center;margin-top:10px">🔒 Paiement sécurisé par Stripe · votre espace est créé dès la confirmation</p>' : ''}
+    </form>
+    <p class="small muted">Déjà client ? <a href="/connexion">Se connecter</a></p></div>
+    <script>(function(){var P=${jsonForScript(prices)},f=document.getElementById('signup'),t=document.getElementById('total');
+      function fx(n){return new Intl.NumberFormat('fr-FR').format(n).replace(/[\\s\\u202f]/g,'\\u00a0')+'\\u00a0XPF';}
+      function up(){var p=f.querySelector('input[name=plan]:checked'),c=f.querySelector('input[name=cycle]:checked');if(!p||!c)return;var x=P[p.value];
+        t.textContent=c.value==='annuel'?'À régler aujourd’hui : '+fx(x.a)+' pour 12 mois (au lieu de '+fx(x.m*12)+').':'À régler aujourd’hui : '+fx(x.m)+', puis '+fx(x.m)+' chaque mois.';}
+      f.addEventListener('change',up);up();})();</script>`;
+  return html(appPage({ title: 'Créer ma boutique', body }), 200, { 'cache-control': 'no-store' });
 }
 
 async function onboardingPost(request, env, url) {
-  const who = await currentUser(request, env);
-  if (!who) return redirect('/connexion?next=/demarrer');
-  if (who.user) return redirect(who.user.role === 'admin' ? '/admin' : '/tableau-de-bord');
   const f = await readForm(request);
   const values = {
     nom: clean(f.get('nom'), 60), sous_domaine: slugify(f.get('sous_domaine') || f.get('nom')),
     modele: MODELES[f.get('modele')] ? f.get('modele') : 'lagon', plan: PLANS[f.get('plan')] ? f.get('plan') : 'plan_1',
     cycle: f.get('cycle') === 'annuel' ? 'annuel' : 'mensuel', g: String(f.get('g') || ''),
+    email: clean(f.get('email'), 120).toLowerCase(),
   };
-  const gen = decodeGen(values.g);
-  const fail = (m) => { const u = new URL(url); u.searchParams.set('err', m); return onboardingForm(request, env, u, values); };
+  const password = String(f.get('password') || '');
+  const fail = (m) => { const u = new URL(url); u.search = ''; u.searchParams.set('err', m); return onboardingForm(request, env, u, values); };
   if (!values.nom) return fail('Indiquez le nom de la boutique.');
   if (values.sous_domaine.length < 3 || RESERVED.has(values.sous_domaine)) return fail('Cette adresse n’est pas disponible (3 caractères minimum).');
+  if (!isEmail(values.email)) return fail('Adresse e-mail invalide.');
+  if (password.length < 8) return fail('Le mot de passe doit faire au moins 8 caractères.');
   if (!f.get('cgu')) return fail('Merci d’accepter les conditions générales.');
   const domaine = env.ROOT_DOMAIN ? `${values.sous_domaine}.${env.ROOT_DOMAIN.toLowerCase()}` : values.sous_domaine;
   if (await env.DB.prepare('SELECT 1 FROM boutiques WHERE domaine = ?').bind(domaine).first()) return fail('Cette adresse de boutique est déjà prise.');
+  if (await env.DB.prepare('SELECT 1 FROM utilisateurs WHERE email_google = ?').bind(values.email).first()) return fail('Un compte existe déjà avec cet e-mail : connectez-vous.');
 
-  const m = getModele(values.modele);
+  const { hash, salt } = await hashPassword(password);
   const id = uid();
-  const echeance = addDays(nowIso(), int(env.TRIAL_DAYS, 14));
-  const sameModele = gen && gen.modele === values.modele;
-  const cp = sameModele ? gen.couleur_principale : m.primary;
-  const cs = sameModele ? gen.couleur_secondaire : m.secondary;
-  const sections = gen ? gen.sections : defaultSections({ nom: values.nom });
-  const offres = gen ? gen.offres.slice(0, getPlan(values.plan).maxProducts) : [];
+  await env.DB.prepare(`INSERT INTO inscriptions (id, email, mot_de_passe, sel, nom, domaine, modele, plan, cycle, gen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, values.email, hash, salt, values.nom, domaine, values.modele, values.plan, values.cycle, decodeGen(values.g) ? values.g : null).run();
+
+  if (stripeReady(env)) {
+    const price = priceFor(env, values.plan, values.cycle);
+    if (!price) return fail('Paiement indisponible pour cette formule : écrivez au support.');
+    try {
+      const s = await createCheckout(env, {
+        price, email: values.email, metadata: { inscription: id }, origin: url.origin,
+        description: `Hinova Boutiques — ${values.nom} (${getPlan(values.plan).label}, ${values.cycle})`,
+      });
+      return redirect(s.url);
+    } catch (e) {
+      console.error(e && e.message);
+      return fail('Le paiement n’a pas pu démarrer. Réessayez dans un instant.');
+    }
+  }
+  // Sans Stripe configuré : la boutique est créée tout de suite avec la période d'essai.
+  const bid = await finalizeInscription(env, id, {});
+  if (!bid) return fail('Création impossible, réessayez.');
+  return redirect(withMsg('/tableau-de-bord', 'ok', 'Bienvenue ! Votre boutique est créée. Suivez les étapes ci-dessous pour l’ouvrir.'), { 'set-cookie': await sessionCookie(env, values.email) });
+}
+
+// Transforme une inscription en boutique (une seule fois, même si le webhook et le retour de paiement arrivent ensemble).
+async function finalizeInscription(env, inscId, info) {
+  const insc = await env.DB.prepare('SELECT * FROM inscriptions WHERE id = ?').bind(inscId).first();
+  if (!insc) return null;
+  const echeance = info.periodEnd ? new Date(info.periodEnd).toISOString()
+    : info.paid ? addMonths(nowIso(), insc.cycle === 'annuel' ? 12 : 1) : addDays(nowIso(), int(env.TRIAL_DAYS, 14));
+  const attachStripe = (bid) => (info.customer || info.subscription)
+    ? env.DB.prepare(`UPDATE boutiques SET stripe_customer_id = COALESCE(?, stripe_customer_id), stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+        date_echeance = CASE WHEN ? > COALESCE(date_echeance, '') THEN ? ELSE date_echeance END, statut = 'active' WHERE id = ?`)
+      .bind(info.customer || null, info.subscription || null, echeance, echeance, bid).run() : null;
+
+  if (insc.statut === 'terminee') { if (insc.boutique_id) await attachStripe(insc.boutique_id); return insc.boutique_id; }
+  const bid = uid();
+  const claim = await env.DB.prepare(`UPDATE inscriptions SET statut = 'terminee', boutique_id = ? WHERE id = ? AND statut = 'en_attente'`).bind(bid, inscId).run();
+  if (!claim.meta.changes) {
+    const again = await env.DB.prepare('SELECT boutique_id FROM inscriptions WHERE id = ?').bind(inscId).first();
+    if (again?.boutique_id) await attachStripe(again.boutique_id);
+    return again?.boutique_id || null;
+  }
+  const existing = await env.DB.prepare('SELECT * FROM utilisateurs WHERE email_google = ?').bind(insc.email).first();
+  if (existing?.boutique_id) {
+    await env.DB.prepare('UPDATE inscriptions SET boutique_id = ? WHERE id = ?').bind(existing.boutique_id, inscId).run();
+    await attachStripe(existing.boutique_id);
+    return existing.boutique_id;
+  }
+  const gen = decodeGen(insc.gen);
+  const m = getModele(insc.modele);
+  const same = gen && gen.modele === insc.modele;
+  const sections = gen ? gen.sections : defaultSections({ nom: insc.nom });
+  const offres = gen ? gen.offres.slice(0, getPlan(insc.plan).maxProducts) : [];
+  // L'adresse a pu être prise entre-temps : on ajoute un suffixe si besoin.
+  let domaine = insc.domaine;
+  for (let i = 2; i < 30 && await env.DB.prepare('SELECT 1 FROM boutiques WHERE domaine = ?').bind(domaine).first(); i++) {
+    domaine = insc.domaine.replace(/^([^.]+)/, `$1-${i}`);
+  }
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json, slogan)
-      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, values.nom, domaine, values.modele, echeance, values.plan, values.cycle, cp, cs, JSON.stringify(sections), gen ? gen.slogan : null),
-    env.DB.prepare(`INSERT INTO utilisateurs (email_google, boutique_id, role) VALUES (?, ?, 'client')`).bind(who.email, id),
+    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json, slogan, stripe_customer_id, stripe_subscription_id)
+      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(bid, insc.nom, domaine, insc.modele, echeance, insc.plan, insc.cycle, same ? gen.couleur_principale : m.primary, same ? gen.couleur_secondaire : m.secondary,
+        JSON.stringify(sections), gen ? gen.slogan : null, info.customer || null, info.subscription || null),
+    existing
+      ? env.DB.prepare(`UPDATE utilisateurs SET boutique_id = ?, role = 'client', mot_de_passe = ?, sel = ? WHERE email_google = ? AND role = 'client'`).bind(bid, insc.mot_de_passe, insc.sel, insc.email)
+      : env.DB.prepare(`INSERT INTO utilisateurs (email_google, boutique_id, role, mot_de_passe, sel) VALUES (?, ?, 'client', ?, ?)`).bind(insc.email, bid, insc.mot_de_passe, insc.sel),
     ...offres.map((o, i) => env.DB.prepare('INSERT INTO offres (id, boutique_id, nom, description, prix_xpf, stock, ordre) VALUES (?, ?, ?, ?, ?, 1, ?)')
-      .bind(uid(), id, o.nom, o.description, o.prix_xpf, i + 1)),
+      .bind(uid(), bid, o.nom, o.description, o.prix_xpf, i + 1)),
   ]);
-  return redirect(withMsg('/tableau-de-bord', 'ok', 'Bienvenue ! Votre boutique est créée. Suivez les étapes ci-dessous pour l’ouvrir.'));
+  return bid;
+}
+
+// Retour de Stripe après paiement : on vérifie la session auprès de Stripe, on crée l'espace et on connecte le commerçant.
+async function welcome(request, env, url) {
+  if (!stripeReady(env)) return redirect('/');
+  const sid = String(url.searchParams.get('session_id') || '');
+  if (!/^cs_(live|test)_[A-Za-z0-9]+$/.test(sid)) return redirect('/demarrer');
+  let s;
+  try { s = await getCheckout(env, sid); } catch (e) { console.error(e && e.message); return redirect(withMsg('/connexion', 'err', 'Paiement en cours de vérification : connectez-vous dans un instant.')); }
+  if (s.status !== 'complete' || Date.now() / 1000 - s.created > 86400) return redirect(withMsg('/demarrer', 'err', 'Paiement non finalisé.'));
+  const sub = typeof s.subscription === 'object' ? s.subscription : null;
+  const info = { customer: s.customer, subscription: sub ? sub.id : s.subscription, periodEnd: periodEnd(sub), paid: true };
+  if (s.metadata?.boutique) {
+    await attachToBoutique(env, s.metadata.boutique, info);
+    return redirect(withMsg('/tableau-de-bord', 'ok', 'Abonnement activé, merci !'));
+  }
+  const bid = await finalizeInscription(env, s.metadata?.inscription, info);
+  const insc = await env.DB.prepare('SELECT email FROM inscriptions WHERE id = ?').bind(s.metadata?.inscription || '').first();
+  if (!bid || !insc) return redirect(withMsg('/connexion', 'err', 'Votre espace se prépare : connectez-vous dans un instant.'));
+  return redirect(withMsg('/tableau-de-bord', 'ok', 'Paiement confirmé, bienvenue ! Votre espace est prêt : suivez les étapes ci-dessous.'), { 'set-cookie': await sessionCookie(env, insc.email) });
+}
+
+async function attachToBoutique(env, boutiqueId, info) {
+  const echeance = info.periodEnd ? new Date(info.periodEnd).toISOString() : null;
+  await env.DB.prepare(`UPDATE boutiques SET stripe_customer_id = COALESCE(?, stripe_customer_id), stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+      statut = 'active', date_echeance = COALESCE(?, date_echeance) WHERE id = ?`).bind(info.customer || null, info.subscription || null, echeance, boutiqueId).run();
+}
+
+// Notifications Stripe : paiement initial, renouvellements, impayés, résiliations, changements de formule.
+async function stripeWebhook(request, env) {
+  const payload = await request.text();
+  const secret = env.STRIPE_WEBHOOK_SECRET || await configValue(env, 'stripe_webhook_secret');
+  if (!await verifyWebhook(payload, request.headers.get('stripe-signature'), secret)) return new Response('Signature invalide', { status: 400 });
+  let evt;
+  try { evt = JSON.parse(payload); } catch { return new Response('JSON invalide', { status: 400 }); }
+  const o = evt.data?.object || {};
+  const bySub = (id) => env.DB.prepare('SELECT id FROM boutiques WHERE stripe_subscription_id = ?').bind(id).first();
+  switch (evt.type) {
+    case 'checkout.session.completed': {
+      if (o.mode !== 'subscription') break;
+      let pe = null;
+      if (stripeReady(env) && o.subscription) { try { pe = periodEnd(await getSubscription(env, o.subscription)); } catch { /* la facture suivra */ } }
+      const info = { customer: o.customer, subscription: o.subscription, periodEnd: pe, paid: o.payment_status === 'paid' };
+      if (o.metadata?.boutique) await attachToBoutique(env, o.metadata.boutique, info);
+      else if (o.metadata?.inscription) await finalizeInscription(env, o.metadata.inscription, info);
+      break;
+    }
+    case 'invoice.paid': {
+      const subId = invoiceSubscription(o);
+      const pe = invoicePeriodEnd(o);
+      if (!subId) break;
+      const b = await bySub(subId);
+      if (b) {
+        await env.DB.prepare(`UPDATE boutiques SET statut = 'active', date_echeance = ? WHERE id = ?`).bind(new Date(pe || Date.now() + 30 * 86400000).toISOString(), b.id).run();
+      } else {
+        const meta = invoiceMetadata(o);
+        const info = { customer: o.customer, subscription: subId, periodEnd: pe, paid: true };
+        if (meta.boutique) await attachToBoutique(env, meta.boutique, info);
+        else if (meta.inscription) await finalizeInscription(env, meta.inscription, info);
+      }
+      break;
+    }
+    case 'customer.subscription.updated': {
+      const b = await bySub(o.id);
+      if (!b) break;
+      const price = o.items?.data?.[0]?.price?.metadata || {};
+      const stopped = ['canceled', 'unpaid', 'incomplete_expired'].includes(o.status);
+      const pe = periodEnd(o);
+      await env.DB.prepare(`UPDATE boutiques SET plan = COALESCE(?, plan), cycle = COALESCE(?, cycle), statut = CASE WHEN ? THEN 'suspendue' ELSE statut END,
+          date_echeance = COALESCE(?, date_echeance) WHERE id = ?`)
+        .bind(PLANS[price.plan] ? price.plan : null, ['mensuel', 'annuel'].includes(price.cycle) ? price.cycle : null, stopped ? 1 : 0,
+          !stopped && pe ? new Date(pe).toISOString() : null, b.id).run();
+      break;
+    }
+    case 'customer.subscription.deleted': {
+      const b = await bySub(o.id);
+      if (b) await env.DB.prepare(`UPDATE boutiques SET statut = 'suspendue' WHERE id = ?`).bind(b.id).run();
+      break;
+    }
+    default: break; // invoice.payment_failed : Stripe relance le client ; la tâche planifiée suspend après l'échéance + délai de grâce
+  }
+  return Response.json({ recu: true });
 }
 
 // ───────────────────────────── Générateur IA ─────────────────────────────
@@ -362,6 +580,7 @@ async function dashboard(request, env, url, b, who, sub) {
   if (section === 'parametres') return post ? settingsPost(request, env, b) : settingsForm(url, b);
   if (section === 'apparence') return post ? appearancePost(request, env, b) : appearanceForm(env, url, b);
   if (section === 'osb') return post ? osbPost(request, env, b, who) : osbForm(env, url, b, who);
+  if (section === 'abonnement' && post) return subscriptionAction(env, url, b, who, id);
   if (section === 'produits') {
     if (!id) return post ? productSave(request, env, b, null) : productList(env, url, b);
     if (action === 'supprimer' && post) return productDelete(env, b, id);
@@ -381,7 +600,6 @@ async function dashHome(env, url, b) {
   const u = await usage(env, b);
   const link = storeUrl(env, b, url.origin);
   const offline = isOffline(b, env);
-  const payLink = env['PAY_LINK_' + b.plan.toUpperCase()];
   const steps = [
     [methodsOf(b).length > 0, 'Indiquez au moins un moyen de paiement', '/tableau-de-bord/parametres'],
     [u.offres > 0, 'Ajoutez votre premier produit', '/tableau-de-bord/produits'],
@@ -406,10 +624,35 @@ async function dashHome(env, url, b) {
   </div>
   ${surplus ? `<div class="flash err">${surplus} vente(s) au-delà du quota de votre formule ce mois-ci : elles seront facturées en supplément, ou passez à la formule supérieure.</div>` : ''}
   <div class="card"><h2>Mon abonnement</h2>
-    <p>${esc(plan.label)} : <b>${fmtXpf(plan.monthly)}</b> / mois, ou <b>${fmtXpf(annualPrice(plan))}</b> / an.</p>
-    ${payLink ? `<a class="btn" href="${esc(payLink)}" target="_blank" rel="noopener">Régler mon abonnement</a>` : `<p class="muted">Pour régler votre abonnement, écrivez à <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a>.</p>`}
+    <p>${esc(plan.label)}, ${b.cycle === 'annuel' ? `annuel : <b>${fmtXpf(annualPrice(plan))}</b> / an` : `mensuel : <b>${fmtXpf(plan.monthly)}</b> / mois`} · prochaine échéance le ${fmtDate(b.date_echeance)}.</p>
+    ${stripeReady(env) && b.stripe_customer_id
+      ? `<form method="post" action="/tableau-de-bord/abonnement"><button class="btn">Gérer mon abonnement</button></form>
+         <p class="small muted">Carte bancaire, factures, changement de formule ou résiliation, sur l’espace sécurisé Stripe.</p>`
+      : stripeReady(env)
+        ? `<form method="post" action="/tableau-de-bord/abonnement/activer"><button class="btn">Activer mon abonnement par carte</button></form>`
+        : `<p class="muted">Pour régler votre abonnement, écrivez à <a href="mailto:${esc(env.SUPPORT_EMAIL)}">${esc(env.SUPPORT_EMAIL)}</a>.</p>`}
   </div>`;
   return dash('Tableau de bord', '/tableau-de-bord', body);
+}
+
+// Portail Stripe (carte, factures, résiliation) ou activation d'un abonnement pour une boutique créée sans paiement.
+async function subscriptionAction(env, url, b, who, action) {
+  if (!stripeReady(env)) return redirect('/tableau-de-bord');
+  try {
+    if (action === 'activer') {
+      const price = priceFor(env, b.plan, b.cycle);
+      if (!price) return redirect(withMsg('/tableau-de-bord', 'err', 'Formule indisponible au paiement : écrivez au support.'));
+      const s = await createCheckout(env, { price, email: who.email, customer: b.stripe_customer_id || undefined, metadata: { boutique: b.id }, origin: url.origin,
+        cancelPath: '/tableau-de-bord', description: `Hinova Boutiques — ${b.nom}` });
+      return redirect(s.url);
+    }
+    if (!b.stripe_customer_id) return redirect('/tableau-de-bord');
+    const portal = await createPortal(env, b.stripe_customer_id, `${url.origin}/tableau-de-bord`);
+    return redirect(portal.url);
+  } catch (e) {
+    console.error(e && e.message);
+    return redirect(withMsg('/tableau-de-bord', 'err', 'L’espace de paiement est momentanément indisponible. Réessayez dans un instant.'));
+  }
 }
 
 // ───────────── Paramètres ─────────────

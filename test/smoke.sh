@@ -23,15 +23,19 @@ check "pages internes non encadrables" 'curl -s -D - -o /dev/null $BASE/connexio
 echo "2. Connexion et création de boutique"
 check "tableau de bord sans session → connexion" '[[ "$(loc $BASE/tableau-de-bord)" == */connexion* ]]'
 check "redirection externe bloquée après connexion" '[[ "$(loc "$BASE/auth/dev?email=x@test.pf&next=//pirate.example")" == "$BASE/tableau-de-bord" ]]'
-login "$J" "$EMAIL"
-check "nouveau compte → création de boutique" '[[ "$(loc -b "$J" $BASE/tableau-de-bord)" == */demarrer ]]'
-check "POST d’une autre origine refusé" '[ "$(code -b "$J" -H "Origin: https://pirate.example" -X POST $BASE/demarrer)" = 403 ]'
-r=$(loc -b "$J" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Boutique Test" -d sous_domaine=$SLUG -d modele=tiare -d plan=plan_1 -d cycle=mensuel -d cgu=on)
-check "boutique créée" '[[ "$r" == */tableau-de-bord?ok=* ]]'
+check "page d’inscription : compte, formule, mensuel ou annuel" 'F=$(curl -s "$BASE/demarrer?plan=plan_2"); echo "$F" | grep -q "name=\"password\"" && echo "$F" | grep -q "Annuel, payé comptant"'
+check "POST d’une autre origine refusé" '[ "$(code -H "Origin: https://pirate.example" -X POST $BASE/demarrer)" = 403 ]'
+check "mot de passe trop court refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=x-$R -d email=x$R@test.pf -d password=court -d cgu=on | grep -q "8 caractères"'
+r=$(loc -c "$J" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Boutique Test" -d sous_domaine=$SLUG -d modele=tiare -d plan=plan_1 -d cycle=mensuel \
+  -d email=$EMAIL -d password=motdepasse123 -d cgu=on)
+check "inscription sans Stripe configuré → espace créé et connecté" '[[ "$r" == */tableau-de-bord?ok=* ]]'
 check "tableau de bord affiché" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Boutique Test"'
-login "$J2" "autre$R@test.pf"
-check "adresse déjà prise refusée" 'curl -s -b "$J2" "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=$SLUG -d modele=lagon -d plan=plan_1 -d cgu=on | grep -q "déjà prise"'
-curl -s -o /dev/null -b "$J2" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Autre" -d sous_domaine=autre-$R -d modele=lagon -d plan=plan_1 -d cgu=on
+check "e-mail déjà utilisé refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=y-$R -d email=$EMAIL -d password=motdepasse123 -d cgu=on | grep -q "existe déjà"'
+check "adresse déjà prise refusée" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=$SLUG -d email=z$R@test.pf -d password=motdepasse123 -d cgu=on | grep -q "déjà prise"'
+curl -s -o /dev/null -c "$J2" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Autre" -d sous_domaine=autre-$R -d modele=lagon -d plan=plan_1 -d email=autre$R@test.pf -d password=motdepasse123 -d cgu=on
+check "connexion par mot de passe" '[[ "$(loc "${H[@]}" -X POST $BASE/connexion -d email=$EMAIL -d password=motdepasse123)" == */tableau-de-bord ]]'
+check "mauvais mot de passe refusé" '[[ "$(loc "${H[@]}" -X POST $BASE/connexion -d email=$EMAIL -d password=fauxfauxfaux)" == *err=* ]]'
+check "déjà client → /demarrer renvoie vers son espace" '[[ "$(loc -b "$J" $BASE/demarrer)" == */tableau-de-bord ]]'
 
 echo "3. Paramètres et paiements"
 curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/parametres" --data-urlencode "nom=Boutique Test" \
@@ -122,16 +126,32 @@ check "génération : modèle Tiare deviné, nom gardé" 'echo "$GEN" | grep -q 
 APERCU=$(echo "$GEN" | grep -o '"apercu":"[^"]*"' | cut -d'"' -f4); CREER=$(echo "$GEN" | grep -o '"creer":"[^"]*"' | cut -d'"' -f4)
 check "aperçu en direct affichable dans l’accueil" 'curl -s -D - "$BASE$APERCU" | grep -qi "x-frame-options: SAMEORIGIN"'
 check "aperçu falsifié refusé" '[ "$(code "$BASE/apercu?g=nimporte")" = 404 ]'
-JG="$TMP/jg"; login "$JG" "gen$R@test.pf"
+JG="$TMP/jg"
 G=$(echo "$CREER" | sed 's/.*g=//')
-check "formulaire de création pré-rempli par la génération" 'curl -s -b "$JG" "$BASE$CREER" | grep -q "value=\"Vai Soins\""'
-curl -s -o /dev/null -b "$JG" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Vai Soins" -d sous_domaine=vai-$R -d modele=tiare -d plan=plan_1 -d cgu=on --data-urlencode "g=$G"
+check "formulaire de création pré-rempli par la génération" 'curl -s "$BASE$CREER" | grep -q "value=\"Vai Soins\""'
+curl -s -o /dev/null -c "$JG" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Vai Soins" -d sous_domaine=vai-$R -d modele=tiare -d plan=plan_1 -d cgu=on --data-urlencode "g=$G" -d email=gen$R@test.pf -d password=motdepasse123
 check "boutique créée avec les 4 produits générés" 'curl -s -b "$JG" $BASE/tableau-de-bord | grep -q "<b>4 / 9</b>"'
 check "vitrine générée avec ses textes" 'curl -s $BASE/b/vai-$R | grep -q "parfum du fenua"'
 check "panier en overlay présent dans une boutique qui vend" 'S=$(curl -s $BASE/b/$SLUG); echo "$S" | grep -q "id=\"cart-open\"" && echo "$S" | grep -q "data-add="'
 check "pas de panier tant qu’aucun paiement n’est configuré" '! curl -s $BASE/b/vai-$R | grep -q "id=\"cart-open\""'
 
-echo "10. Session"
+echo "10. Abonnements Stripe (webhook signé)"
+WHS="${WHS:-whsec_test_local_123}"
+hook(){ local t=$(date +%s); local sig=$(printf '%s' "$t.$1" | openssl dgst -sha256 -hmac "$WHS" -hex | sed 's/^.* //'); curl -s -o /dev/null -w '%{http_code}' -X POST -H "content-type: application/json" -H "stripe-signature: t=$t,v1=$sig" --data-binary "$1" "$BASE/api/stripe/webhook"; }
+check "webhook sans signature refusé" '[ "$(code -X POST -H "content-type: application/json" -d "{}" $BASE/api/stripe/webhook)" = 400 ]'
+check "webhook mal signé refusé" '[ "$(code -X POST -H "stripe-signature: t=$(date +%s),v1=abc" -d "{}" $BASE/api/stripe/webhook)" = 400 ]'
+SUB="sub_test_$R"; END=$(( $(date +%s) + 400*86400 ))
+check "paiement Stripe rattaché à la boutique" '[ "$(hook "{\"type\":\"checkout.session.completed\",\"data\":{\"object\":{\"mode\":\"subscription\",\"customer\":\"cus_$R\",\"subscription\":\"$SUB\",\"payment_status\":\"paid\",\"metadata\":{\"boutique\":\"$BID\"}}}}")" = 200 ]'
+hook "{\"type\":\"invoice.paid\",\"data\":{\"object\":{\"customer\":\"cus_$R\",\"parent\":{\"subscription_details\":{\"subscription\":\"$SUB\"}},\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+Y2=$(TZ=Pacific/Tahiti date -d @$END +%Y)
+check "renouvellement payé → échéance prolongée" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "/$Y2"'
+check "bouton « Gérer mon abonnement » absent tant que Stripe n’est pas branché" '! curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Gérer mon abonnement"'
+hook "{\"type\":\"customer.subscription.deleted\",\"data\":{\"object\":{\"id\":\"$SUB\"}}}" >/dev/null
+check "résiliation → boutique hors ligne" '[ "$(code $BASE/b/$SLUG)" = 503 ]'
+hook "{\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+check "nouveau paiement → boutique en ligne" '[ "$(code $BASE/b/$SLUG)" = 200 ]'
+
+echo "11. Session"
 curl -s -o /dev/null -c "$J" "$BASE/deconnexion"
 check "déconnexion effective" '[[ "$(loc -b "$J" $BASE/tableau-de-bord)" == */connexion* ]]'
 check "cookie de session falsifié refusé" '[[ "$(loc -H "Cookie: hb_s=eyJlIjoiYWRtaW5AdGVzdC5wZiJ9.AAAA" $BASE/admin)" == */connexion* ]]'
