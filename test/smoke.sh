@@ -25,14 +25,15 @@ check "tableau de bord sans session → connexion" '[[ "$(loc $BASE/tableau-de-b
 check "redirection externe bloquée après connexion" '[[ "$(loc "$BASE/auth/dev?email=x@test.pf&next=//pirate.example")" == "$BASE/tableau-de-bord" ]]'
 check "page d’inscription : compte, formule, mensuel ou annuel" 'F=$(curl -s "$BASE/demarrer?plan=plan_2"); echo "$F" | grep -q "name=\"password\"" && echo "$F" | grep -q "Annuel, payé comptant"'
 check "POST d’une autre origine refusé" '[ "$(code -H "Origin: https://pirate.example" -X POST $BASE/demarrer)" = 403 ]'
-check "mot de passe trop court refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=x-$R -d email=x$R@test.pf -d password=court -d cgu=on | grep -q "8 caractères"'
+check "mot de passe trop court refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=x-$R -d email=x$R@test.pf -d password=court -d cgu=on -d titulaire=on | grep -q "8 caractères"'
 r=$(loc -c "$J" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Boutique Test" -d sous_domaine=$SLUG -d modele=tiare -d plan=plan_1 -d cycle=mensuel \
-  -d email=$EMAIL -d password=motdepasse123 -d cgu=on)
+  -d email=$EMAIL -d password=motdepasse123 -d cgu=on -d titulaire=on)
 check "inscription sans Stripe configuré → espace créé et connecté" '[[ "$r" == */tableau-de-bord?ok=* ]]'
 check "tableau de bord affiché" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Boutique Test"'
-check "e-mail déjà utilisé refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=y-$R -d email=$EMAIL -d password=motdepasse123 -d cgu=on | grep -q "existe déjà"'
-check "adresse déjà prise refusée" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=$SLUG -d email=z$R@test.pf -d password=motdepasse123 -d cgu=on | grep -q "déjà prise"'
-curl -s -o /dev/null -c "$J2" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Autre" -d sous_domaine=autre-$R -d modele=lagon -d plan=plan_1 -d email=autre$R@test.pf -d password=motdepasse123 -d cgu=on
+check "attestation de titularité obligatoire" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=t-$R -d email=t$R@test.pf -d password=motdepasse123 -d cgu=on | grep -q "certifier"'
+check "e-mail déjà utilisé refusé" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=y-$R -d email=$EMAIL -d password=motdepasse123 -d cgu=on -d titulaire=on | grep -q "existe déjà"'
+check "adresse déjà prise refusée" 'curl -s "${H[@]}" -X POST $BASE/demarrer --data-urlencode "nom=X" -d sous_domaine=$SLUG -d email=z$R@test.pf -d password=motdepasse123 -d cgu=on -d titulaire=on | grep -q "déjà prise"'
+curl -s -o /dev/null -c "$J2" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Autre" -d sous_domaine=autre-$R -d modele=lagon -d plan=plan_1 -d email=autre$R@test.pf -d password=motdepasse123 -d cgu=on -d titulaire=on
 check "connexion par mot de passe" '[[ "$(loc "${H[@]}" -X POST $BASE/connexion -d email=$EMAIL -d password=motdepasse123)" == */tableau-de-bord ]]'
 check "mauvais mot de passe refusé" '[[ "$(loc "${H[@]}" -X POST $BASE/connexion -d email=$EMAIL -d password=fauxfauxfaux)" == *err=* ]]'
 check "déjà client → /demarrer renvoie vers son espace" '[[ "$(loc -b "$J" $BASE/demarrer)" == */tableau-de-bord ]]'
@@ -91,6 +92,10 @@ curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/
 Y=$(TZ=Pacific/Tahiti date +%Y)
 check "paiement → facture F$Y-0001" 'curl -s -b "$J" $BASE/tableau-de-bord/commandes/$CMD | grep -q "F$Y-0001"'
 check "facture publique avec n° Tahiti et mentions" 'F=$(curl -s $BASE/f/$CMD); echo "$F" | grep -q "A12345" && echo "$F" | grep -q "Patente n° 999"'
+check "PDF facture + étiquette téléchargeable" '[ "$(curl -s -b "$J" $BASE/tableau-de-bord/commandes/$CMD/documents | head -c 5)" = "%PDF-" ]'
+check "PDF avec déclaration en douane (3 pages)" '[ "$(curl -s -b "$J" "$BASE/tableau-de-bord/commandes/$CMD/documents?douane=1" | grep -c "/Type /Page /")" = 3 ]'
+check "PDF d’une commande invisible pour un autre commerçant" '[ "$(code -b "$J2" $BASE/tableau-de-bord/commandes/$CMD/documents)" = 404 ]'
+check "envoi par e-mail non configuré signalé au commerçant" 'curl -s -b "$J" $BASE/tableau-de-bord/commandes/$CMD | grep -q "pas encore activé"'
 check "vente payée comptée (1 / 50)" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "<b>1 / 50</b>"'
 curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/$CMD/avancer"
 check "expédition enregistrée" 'curl -s -b "$J" $BASE/tableau-de-bord/commandes/$CMD | grep -q ">Expédiée<"'
@@ -150,7 +155,7 @@ check "aperçu falsifié refusé" '[ "$(code "$BASE/apercu?g=nimporte")" = 404 ]
 JG="$TMP/jg"
 G=$(echo "$CREER" | sed 's/.*g=//')
 check "formulaire de création pré-rempli par la génération" 'curl -s "$BASE$CREER" | grep -q "value=\"Vai Soins\""'
-curl -s -o /dev/null -c "$JG" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Vai Soins" -d sous_domaine=vai-$R -d modele=tiare -d plan=plan_1 -d cgu=on --data-urlencode "g=$G" -d email=gen$R@test.pf -d password=motdepasse123
+curl -s -o /dev/null -c "$JG" "${H[@]}" -X POST "$BASE/demarrer" --data-urlencode "nom=Vai Soins" -d sous_domaine=vai-$R -d modele=tiare -d plan=plan_1 -d cgu=on -d titulaire=on --data-urlencode "g=$G" -d email=gen$R@test.pf -d password=motdepasse123
 check "boutique créée avec les 4 produits générés" 'curl -s -b "$JG" $BASE/tableau-de-bord | grep -q "<b>4 / 9</b>"'
 check "vitrine générée avec ses textes" 'curl -s $BASE/b/vai-$R | grep -q "parfum du fenua"'
 check "panier en overlay présent dans une boutique qui vend" 'S=$(curl -s $BASE/b/$SLUG); echo "$S" | grep -q "id=\"cart-open\"" && echo "$S" | grep -q "data-add="'
@@ -169,7 +174,8 @@ IMG=(-H "CF-Connecting-IP: 10.4.$R")
 check "image : faux fichier refusé" '[ "$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/faux.png;type=image/png" $BASE/api/generer)" = 400 ]'
 check "image illisible sans description → demande une phrase" '[ "$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/cap.png;type=image/png" $BASE/api/generer)" = 422 ]'
 check "image + description → boutique proposée" 'curl -s "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/cap.png;type=image/png" -F "description=Savons et monoï au tiare à Tahiti" $BASE/api/generer | grep -q "\"apercu\""'
-check "accueil : import d’image et conseil capture réseau social" 'L=$(curl -s $BASE/); echo "$L" | grep -q "type=\"file\"" && echo "$L" | grep -qi "capture d’écran"'
+check "accueil : import d’image et conseil capture réseau social" 'L=$(curl -s $BASE/); echo "$L" | grep -q "type=\"file\"" && echo "$L" | grep -qi "capture d’écran de votre profil"'
+check "vitrine : lien « Signaler cette boutique »" 'curl -s $BASE/b/vai-$R | grep -q "Signaler cette boutique"'
 check "vitrine : monogramme quand il n’y a pas de logo" 'curl -s $BASE/b/vai-$R | grep -q "class=\"mono\""'
 
 echo "10. Abonnements Stripe (webhook signé)"

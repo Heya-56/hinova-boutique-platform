@@ -18,6 +18,8 @@ import { EDITOR_JS, EDITOR_CSS } from './editor.js';
 import { landingPage } from './landing.js';
 import { generateShop, fallbackGen, encodeGen, decodeGen, readImage } from './ai.js';
 import { productPhoto } from './photos.js';
+import { orderDocumentsPdf } from './documents.js';
+import { sendMail, mailReady } from './mail.js';
 import {
   stripeReady, priceFor, createCheckout, getCheckout, getSubscription, createPortal, periodEnd, invoicePeriodEnd, invoiceSubscription, invoiceMetadata, verifyWebhook, addSubscriptionItem,
 } from './stripe.js';
@@ -317,6 +319,7 @@ function onboardingForm(request, env, url, values = {}) {
         <div><label for="em">E-mail</label><input id="em" name="email" type="email" required maxlength="120" autocomplete="email" value="${esc(values.email)}"></div>
         <div><label for="pw">Mot de passe (8 caractères minimum)</label><input id="pw" name="password" type="password" minlength="8" required autocomplete="new-password"></div>
       </div>
+      <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start;margin-top:16px"><input type="checkbox" name="titulaire" required style="margin-top:5px"> Je certifie être le ou la titulaire de cette activité, ou être autorisé(e) à la représenter, et détenir les droits sur le nom, le logo et les images que j’utilise. Toute usurpation entraîne la fermeture immédiate de la boutique.</label>
       <label style="font-weight:400;display:flex;gap:8px;align-items:flex-start;margin-top:16px"><input type="checkbox" name="cgu" required style="margin-top:5px"> J’accepte les conditions générales. L’abonnement est renouvelé automatiquement ; en cas d’impayé, la boutique est mise hors ligne jusqu’à régularisation.</label>
       <button class="btn" type="submit" style="width:100%">${pay ? 'Payer par carte et créer ma boutique' : 'Créer ma boutique'}</button>
       ${pay ? '<p class="small muted" style="text-align:center;margin-top:10px">🔒 Paiement sécurisé par Stripe · votre espace est créé dès la confirmation</p>' : ''}
@@ -344,6 +347,7 @@ async function onboardingPost(request, env, url) {
   if (values.sous_domaine.length < 3 || RESERVED.has(values.sous_domaine)) return fail('Cette adresse n’est pas disponible (3 caractères minimum).');
   if (!isEmail(values.email)) return fail('Adresse e-mail invalide.');
   if (password.length < 8) return fail('Le mot de passe doit faire au moins 8 caractères.');
+  if (!f.get('titulaire')) return fail('Merci de certifier que vous êtes titulaire de cette activité ou autorisé(e) à la représenter.');
   if (!f.get('cgu')) return fail('Merci d’accepter les conditions générales.');
   const domaine = env.ROOT_DOMAIN ? `${values.sous_domaine}.${env.ROOT_DOMAIN.toLowerCase()}` : values.sous_domaine;
   if (await env.DB.prepare('SELECT 1 FROM boutiques WHERE domaine = ?').bind(domaine).first()) return fail('Cette adresse de boutique est déjà prise.');
@@ -351,8 +355,8 @@ async function onboardingPost(request, env, url) {
 
   const { hash, salt } = await hashPassword(password);
   const id = uid();
-  await env.DB.prepare(`INSERT INTO inscriptions (id, email, mot_de_passe, sel, nom, domaine, modele, plan, cycle, gen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, values.email, hash, salt, values.nom, domaine, values.modele, values.plan, values.cycle, decodeGen(values.g) ? values.g : null).run();
+  await env.DB.prepare(`INSERT INTO inscriptions (id, email, mot_de_passe, sel, nom, domaine, modele, plan, cycle, gen, attestation_le) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, values.email, hash, salt, values.nom, domaine, values.modele, values.plan, values.cycle, decodeGen(values.g) ? values.g : null, nowIso()).run();
 
   if (stripeReady(env)) {
     const price = priceFor(env, values.plan, values.cycle);
@@ -414,10 +418,10 @@ async function finalizeInscription(env, inscId, info) {
     domaine = insc.domaine.replace(/^([^.]+)/, `$1-${i}`);
   }
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json, slogan, stripe_customer_id, stripe_subscription_id)
-      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    env.DB.prepare(`INSERT INTO boutiques (id, nom, domaine, modele, statut, date_echeance, plan, cycle, couleur_principale, couleur_secondaire, sections_json, slogan, stripe_customer_id, stripe_subscription_id, attestation_le)
+      VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(bid, insc.nom, domaine, insc.modele, echeance, insc.plan, insc.cycle, same ? gen.couleur_principale : m.primary, same ? gen.couleur_secondaire : m.secondary,
-        JSON.stringify(sections), gen ? gen.slogan : null, info.customer || null, info.subscription || null),
+        JSON.stringify(sections), gen ? gen.slogan : null, info.customer || null, info.subscription || null, insc.attestation_le || null),
     existing
       ? env.DB.prepare(`UPDATE utilisateurs SET boutique_id = ?, role = 'client', mot_de_passe = ?, sel = ? WHERE email_google = ? AND role = 'client'`).bind(bid, insc.mot_de_passe, insc.sel, insc.email)
       : env.DB.prepare(`INSERT INTO utilisateurs (email_google, boutique_id, role, mot_de_passe, sel) VALUES (?, ?, 'client', ?, ?)`).bind(insc.email, bid, insc.mot_de_passe, insc.sel),
@@ -734,6 +738,8 @@ async function dashboardRoute(request, env, url, b, who, sub) {
   if (section === 'commandes') {
     if (!id) return orderList(env, url, b);
     if (action === 'avancer' && post) return orderAdvance(env, b, id);
+    if (action === 'documents' && !post) return orderDocuments(env, url, b, id);
+    if (action === 'envoyer' && post) return orderResend(env, b, id);
     if (action === 'supprimer' && post) return orderDelete(env, b, id);
     return orderDetail(env, url, b, id);
   }
@@ -1000,6 +1006,54 @@ async function orderList(env, url, b) {
   return dash('Commandes', '/tableau-de-bord/commandes', body);
 }
 
+// ───────────── Documents d'expédition (PDF) ─────────────
+
+async function orderPdf(env, b, id, douane) {
+  const o = await env.DB.prepare('SELECT * FROM commandes WHERE id = ? AND boutique_id = ? AND numero_facture IS NOT NULL').bind(id, b.id).first();
+  if (!o) return null;
+  return { o, bytes: orderDocumentsPdf(b, o, JSON.parse(o.lignes_json), { douane }) };
+}
+
+// Envoie au commerçant (e-mail de son compte) la facture + l'étiquette d'expédition en PDF.
+async function sendOrderDocuments(env, b, id) {
+  const doc = await orderPdf(env, b, id, false);
+  if (!doc) return { ok: false };
+  const u = await env.DB.prepare(`SELECT email_google AS email FROM utilisateurs WHERE boutique_id = ? AND role = 'client' LIMIT 1`).bind(b.id).first();
+  let r = { ok: false, raison: 'sans_email' };
+  if (u?.email) {
+    const ref = doc.o.id.slice(0, 8).toUpperCase();
+    try {
+      r = await sendMail(env, {
+        to: u.email, subject: `Commande ${ref} payée — facture ${doc.o.numero_facture} et étiquette`,
+        html: `<p>Ia ora na,</p><p>La commande <b>${esc(ref)}</b> de ${esc(doc.o.client_nom)} (${fmtXpf(doc.o.total_xpf)}) est payée.</p>
+          <p>Vous trouverez en pièce jointe la facture <b>${esc(doc.o.numero_facture)}</b>, l'étiquette d'expédition prête à imprimer et le bon de préparation.</p>
+          <p>Envoi hors de Polynésie ? La déclaration en douane (CN 23) pré-remplie se télécharge depuis la commande, dans votre espace.</p><p>${esc(env.BRAND || 'Hinova Boutiques')}</p>`,
+        attachments: [{ name: `commande-${ref}.pdf`, bytes: doc.bytes }],
+      });
+    } catch (e) { r = { ok: false, raison: 'erreur_reseau' }; console.error('Envoi des documents', e && e.message); }
+  }
+  await env.DB.prepare('UPDATE commandes SET documents_statut = ?, documents_envoyes_le = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE documents_envoyes_le END WHERE id = ? AND boutique_id = ?')
+    .bind(r.ok ? 'envoye' : r.raison, r.ok ? 1 : 0, id, b.id).run();
+  await audit(env, b.id, 'systeme', r.ok ? 'commande.documents_envoyes' : 'commande.documents_non_envoyes', r.ok ? id : `${id} ${r.raison}`);
+  return r;
+}
+
+async function orderDocuments(env, url, b, id) {
+  const doc = await orderPdf(env, b, id, url.searchParams.get('douane') === '1');
+  if (!doc) return notFound();
+  const ref = doc.o.id.slice(0, 8).toUpperCase();
+  return new Response(doc.bytes, { headers: {
+    'content-type': 'application/pdf', 'content-disposition': `inline; filename="commande-${ref}.pdf"`,
+    'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff',
+  } });
+}
+
+async function orderResend(env, b, id) {
+  const back = `/tableau-de-bord/commandes/${id}`;
+  const r = await sendOrderDocuments(env, b, id);
+  return redirect(withMsg(back, r.ok ? 'ok' : 'err', r.ok ? 'Documents renvoyés par e-mail.' : 'Envoi impossible pour le moment : téléchargez le PDF.'));
+}
+
 async function orderDetail(env, url, b, id) {
   const o = await env.DB.prepare('SELECT * FROM commandes WHERE id = ? AND boutique_id = ?').bind(id, b.id).first();
   if (!o) return notFound();
@@ -1014,9 +1068,15 @@ async function orderDetail(env, url, b, id) {
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       ${next ? `<form method="post" action="/tableau-de-bord/commandes/${o.id}/avancer"><button class="btn small">${next === 'payee' ? 'Marquer payée (émet la facture)' : 'Marquer expédiée'}</button></form>` : ''}
       <button class="btn small ghost" type="button" onclick="window.print()">Imprimer bon + étiquette</button>
+      ${o.numero_facture ? `<a class="btn small" href="/tableau-de-bord/commandes/${o.id}/documents" target="_blank" rel="noopener">PDF facture + étiquette</a>
+      <a class="btn small ghost" href="/tableau-de-bord/commandes/${o.id}/documents?douane=1" target="_blank" rel="noopener">+ déclaration douane (CN 23)</a>
+      <form method="post" action="/tableau-de-bord/commandes/${o.id}/envoyer"><button class="btn small ghost">Recevoir par e-mail</button></form>` : ''}
       ${o.statut === 'en_attente' ? `<form method="post" action="/tableau-de-bord/commandes/${o.id}/supprimer" onsubmit="return confirm('Supprimer cette commande ? Le stock sera remis.')"><button class="btn small danger">Supprimer</button></form>` : ''}
       ${share}
     </div></div>
+  ${o.numero_facture ? `<div class="card noprint"><p class="small" style="margin:0">${o.documents_statut === 'envoye' ? `Facture et étiquette envoyées par e-mail le ${fmtDate(o.documents_envoyes_le)}.`
+    : o.documents_statut === 'non_configure' ? 'Envoi automatique par e-mail pas encore activé sur la plateforme : téléchargez le PDF ci-dessus.'
+    : o.documents_statut ? 'L’envoi par e-mail a échoué : téléchargez le PDF ou réessayez.' : ''}</p></div>` : ''}
   <div class="card"><h1>Bon de commande</h1>
     <p class="muted">${esc(b.nom)} · ${fmtDate(o.cree_le)} · ${esc(PAYMENT_METHODS[o.moyen])} · <span class="badge ${esc(o.statut)}">${esc(ORDER_STATUSES[o.statut])}</span></p>
     <table><thead><tr><th>Article</th><th>Qté</th><th>Prix</th><th>Sous-total</th></tr></thead><tbody>
@@ -1051,7 +1111,8 @@ async function orderAdvance(env, b, id) {
       env.DB.prepare(`INSERT INTO ventes_mensuelles (boutique_id, mois, ventes_count) VALUES (?, ?, 1)
         ON CONFLICT(boutique_id, mois) DO UPDATE SET ventes_count = ventes_count + 1`).bind(b.id, monthKey()),
     ]);
-    return redirect(withMsg(back, 'ok', `Paiement enregistré. Facture ${numero} émise.`));
+    const envoi = await sendOrderDocuments(env, b, id);
+    return redirect(withMsg(back, 'ok', `Paiement enregistré. Facture ${numero} émise.${envoi.ok ? ' Facture et étiquette envoyées par e-mail.' : ''}`));
   }
   return redirect(withMsg(back, 'ok', 'Commande marquée expédiée.'));
 }

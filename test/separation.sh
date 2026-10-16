@@ -8,7 +8,7 @@ check(){ if eval "$2"; then echo "  ✓ $1"; PASS=$((PASS+1)); else echo "  ✗ 
 code(){ curl -s -o /dev/null -w '%{http_code}' "$@"; }
 APP=(-H 'Host: app.test'); SHOP=(-H "Host: sep-$R.boutiques.test")
 C=$(curl -s -D - -o /dev/null "${APP[@]}" -H 'Origin: http://app.test' -X POST "$BASE/demarrer" -d nom=Sep -d sous_domaine=sep-$R -d modele=lagon -d plan=plan_1 \
-  -d email=s$R@test.pf -d password=motdepasse123 -d cgu=on | grep -i '^set-cookie' | sed 's/^[^:]*: //; s/;.*//' | tr -d '\r')
+  -d email=s$R@test.pf -d password=motdepasse123 -d cgu=on -d titulaire=on | grep -i '^set-cookie' | sed 's/^[^:]*: //; s/;.*//' | tr -d '\r')
 echo "Séparation application / vitrines"
 check "le cookie de session n'a pas d'attribut Domain (envoyé à l'application seule)" '! curl -s -D - -o /dev/null "${APP[@]}" -H "Origin: http://app.test" -X POST "$BASE/connexion" -d email=s$R@test.pf -d password=motdepasse123 | grep -qi "set-cookie:.*domain="'
 check "tableau de bord accessible sur l'application" '[ "$(code -H "Cookie: $C" "${APP[@]}" $BASE/tableau-de-bord)" = 200 ]'

@@ -264,7 +264,8 @@ ${annonce}
 ${cart ? '<button class="cart-btn" id="cart-open" type="button" aria-controls="panier">Panier <b id="cart-count">0</b></button>'
   : `<a class="head-cta" href="${ctaHref}"${b.whatsapp ? ' target="_blank" rel="noopener"' : ''}>${b.whatsapp ? 'WhatsApp' : 'Collection'}</a>`}</div></header>
 <main>${body}</main>
-<footer class="shop"><div class="wrap">© ${esc(b.nom)}${b.ile ? ' · ' + esc(b.ile) : ''} · Boutique propulsée par Hinova Digital</div></footer>
+<footer class="shop"><div class="wrap">© ${esc(b.nom)}${b.ile ? ' · ' + esc(b.ile) : ''} · Boutique propulsée par Hinova Digital
+ · <a href="mailto:support@hinovadigitalcorp.com?subject=${encodeURIComponent(`Signalement : ${b.nom} (${b.domaine || ''})`)}&body=${encodeURIComponent('Bonjour, je signale cette boutique pour la raison suivante (usurpation, contenu, arnaque…) : ')}" rel="nofollow">Signaler cette boutique</a></div></footer>
 ${drawer}
 ${cart ? `<script>${CART_JS}</script>` : ''}
 ${clearCart ? `<script>try{localStorage.removeItem('panier:'+${JSON.stringify(cartKey)})}catch(e){}</script>` : ''}

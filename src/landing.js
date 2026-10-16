@@ -226,7 +226,7 @@ export function landingPage(env) {
         <textarea id="desc" maxlength="400" placeholder="Ex. : je fais des bijoux en nacre et en coquillages à Moorea, je veux vendre dans toutes les îles"></textarea>
         <input id="nom" maxlength="60" placeholder="Nom de la boutique (facultatif)" aria-label="Nom de la boutique (facultatif)">
         <label class="drop" for="img"><input id="img" type="file" accept="image/jpeg,image/png,image/webp">
-          <b>Ou importez une image</b><span id="img-name">Astuce : faites une capture d’écran de votre page Facebook, Instagram ou de votre réseau préféré, ou une photo de vos produits. L’IA en tire le nom, l’activité et vos couleurs. L’image n’est pas conservée.</span></label>
+          <b>Ou importez une image</b><span id="img-name">Envoyez une capture d’écran de votre profil de réseau social (Facebook, Instagram…), ou une photo de vos produits. L’IA en tire le nom, l’activité et vos couleurs. L’image n’est pas conservée.</span></label>
         <div class="chips" aria-label="Exemples">${EXAMPLES.map((x) => `<button type="button" class="chip">${esc(x)}</button>`).join('')}</div>
         <button class="go" id="go" type="submit"><i class="spin"></i><span>Générer ma boutique ✦</span></button>
         <p class="err" id="err" role="alert"></p>
