@@ -1,5 +1,6 @@
 // Hinova Boutique Platform — Worker mutualisé : accueil, vitrines, tableau de bord commerçant, admin Hinova.
-// Schéma : migrations/0001 (initial) + 0002 (sections, contacts, paiements) + 0003 (comptes, inscriptions, Stripe).
+// Schéma : migrations/0001 (initial) + 0002 (sections, contacts, paiements) + 0003 (comptes, inscriptions, Stripe)
+// + 0004 (journal des paiements, audit, justificatifs OSB privés).
 import {
   esc, jsonForScript, uid, b64urlDecode, sign, verify, slugify, RESERVED, html, redirect, withMsg,
   getCookie, setCookie, sameOrigin, readForm, safeNext, nowIso, addDays, addMonths, monthKey, yearKey, monthStartSql,
@@ -7,6 +8,7 @@ import {
 } from './lib.js';
 import {
   PLANS, getPlan, annualPrice, MODELES, getModele, PAYMENT_METHODS, ORDER_STATUSES, NEXT_STATUS, BANQUES, OSB_STATUTS, ISLANDS,
+  PAYZEN_OPTION, OSB_PIECES, BANQUES_OSB,
 } from './plans.js';
 import { appPage, storePage, storeColors, flash, dashNav, adminNav, meter } from './views.js';
 import { SECTION_TYPES, defaultSections, sanitizeSections, parseSections, renderSections } from './sections.js';
@@ -25,6 +27,19 @@ const OAUTH = 'hb_oauth';
 const SESSION_DAYS = 30;
 const MAX_IMAGE = 2 * 1024 * 1024;
 const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+const MAX_PIECE = 5 * 1024 * 1024;
+const MAX_PIECES = 6;
+const PIECE_TYPES = { 'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png' };
+// Mode test explicite : seul cas où la connexion de développement et l'inscription sans paiement sont permises.
+const isTest = (env) => env.ENVIRONMENT === 'test';
+
+// Journal d'audit : jamais bloquant pour l'utilisateur.
+async function audit(env, boutiqueId, acteur, action, details) {
+  try {
+    await env.DB.prepare('INSERT INTO journal_audit (boutique_id, acteur, action, details) VALUES (?, ?, ?, ?)')
+      .bind(boutiqueId || null, String(acteur || 'systeme').slice(0, 120), action, details ? String(details).slice(0, 500) : null).run();
+  } catch (e) { console.error('Journal d’audit indisponible', e && e.message); }
+}
 
 export default {
   async fetch(request, env) {
@@ -154,7 +169,7 @@ function loginPage(env, url) {
   const next = safeNext(url.searchParams.get('next') || '/tableau-de-bord');
   const google = env.GOOGLE_CLIENT_ID ? `<p class="small muted" style="margin:18px 0 6px">ou</p>
     <a class="btn google" href="/auth/google?next=${encodeURIComponent(next)}">${GOOGLE_G} Continuer avec Google</a>` : '';
-  const dev = env.DEV_LOGIN === '1' ? `<form method="get" action="/auth/dev" class="card" style="margin-top:16px;border-style:dashed">
+  const dev = env.DEV_LOGIN === '1' && isTest(env) ? `<form method="get" action="/auth/dev" class="card" style="margin-top:16px;border-style:dashed">
       <p class="small muted">Mode développement (désactivé en production)</p><input type="hidden" name="next" value="${esc(next)}">
       <label for="de">E-mail de test</label><input id="de" name="email" type="email" required><button class="btn small" style="margin-top:10px">Connexion test</button></form>` : '';
   const body = `<div style="max-width:440px;margin:30px auto">${flash(url)}<div class="card">
@@ -220,7 +235,7 @@ async function googleCallback(request, env, url) {
 }
 
 async function devLogin(request, env, url) {
-  if (env.DEV_LOGIN !== '1') return notFound();
+  if (env.DEV_LOGIN !== '1' || !isTest(env)) return notFound();
   const email = clean(url.searchParams.get('email'), 120).toLowerCase();
   if (!isEmail(email)) return redirect(withMsg('/connexion', 'err', 'E-mail invalide.'));
   return openSession(env, email, url.searchParams.get('next') || '/tableau-de-bord');
@@ -344,7 +359,11 @@ async function onboardingPost(request, env, url) {
       return fail('Le paiement n’a pas pu démarrer. Réessayez dans un instant.');
     }
   }
-  // Sans Stripe configuré : la boutique est créée tout de suite avec la période d'essai.
+  // Sans Stripe configuré : création immédiate uniquement en environnement de test. En production, aucune boutique sans paiement.
+  if (!isTest(env)) {
+    console.error('Inscription refusée : STRIPE_SECRET_KEY absente ou invalide en production');
+    return fail('Les inscriptions sont momentanément indisponibles. Écrivez-nous : nous revenons vers vous rapidement.');
+  }
   const bid = await finalizeInscription(env, id, {});
   if (!bid) return fail('Création impossible, réessayez.');
   return redirect(withMsg('/tableau-de-bord', 'ok', 'Bienvenue ! Votre boutique est créée. Suivez les étapes ci-dessous pour l’ouvrir.'), { 'set-cookie': await sessionCookie(env, values.email) });
@@ -426,59 +445,100 @@ async function attachToBoutique(env, boutiqueId, info) {
 }
 
 // Notifications Stripe : paiement initial, renouvellements, impayés, résiliations, changements de formule.
+// Source de vérité de l'abonnement (jamais le seul retour du navigateur). Chaque événement n'est traité qu'une fois.
 async function stripeWebhook(request, env) {
   const payload = await request.text();
   const secret = env.STRIPE_WEBHOOK_SECRET || await configValue(env, 'stripe_webhook_secret');
   if (!await verifyWebhook(payload, request.headers.get('stripe-signature'), secret)) return new Response('Signature invalide', { status: 400 });
   let evt;
   try { evt = JSON.parse(payload); } catch { return new Response('JSON invalide', { status: 400 }); }
+  if (typeof evt.id !== 'string' || !/^evt_[A-Za-z0-9_]+$/.test(evt.id) || typeof evt.type !== 'string') return new Response('Événement invalide', { status: 400 });
   const o = evt.data?.object || {};
-  const bySub = (id) => env.DB.prepare('SELECT id FROM boutiques WHERE stripe_subscription_id = ?').bind(id).first();
+
+  // Idempotence : réservation de l'identifiant avant tout traitement.
+  const claim = await env.DB.prepare(`INSERT OR IGNORE INTO paiements_evenements (event_id, type, objet_id) VALUES (?, ?, ?)`)
+    .bind(evt.id, evt.type.slice(0, 80), typeof o.id === 'string' ? o.id.slice(0, 120) : null).run();
+  if (!claim.meta.changes) {
+    const prev = await env.DB.prepare('SELECT statut FROM paiements_evenements WHERE event_id = ?').bind(evt.id).first();
+    if (prev && prev.statut !== 'en_cours') return Response.json({ recu: true, doublon: true });
+    return new Response('Traitement en cours', { status: 409 }); // Stripe renverra l'événement plus tard
+  }
+  try {
+    const { boutiqueId, handled } = await handleStripeEvent(env, evt, o);
+    await env.DB.prepare('UPDATE paiements_evenements SET statut = ?, boutique_id = ? WHERE event_id = ?')
+      .bind(handled ? 'traite' : 'ignore', boutiqueId || null, evt.id).run();
+    return Response.json({ recu: true });
+  } catch (e) {
+    // Échec : on libère l'identifiant pour que la nouvelle tentative de Stripe soit traitée.
+    console.error('Webhook Stripe en échec', evt.type, e && e.message);
+    await env.DB.prepare('DELETE FROM paiements_evenements WHERE event_id = ?').bind(evt.id).run();
+    return new Response('Erreur de traitement', { status: 500 });
+  }
+}
+
+async function handleStripeEvent(env, evt, o) {
+  const bySub = (id) => id ? env.DB.prepare('SELECT id FROM boutiques WHERE stripe_subscription_id = ?').bind(id).first() : null;
   switch (evt.type) {
     case 'checkout.session.completed': {
-      if (o.mode !== 'subscription') break;
+      if (o.mode !== 'subscription') return { handled: false };
       let pe = null;
       if (stripeReady(env) && o.subscription) { try { pe = periodEnd(await getSubscription(env, o.subscription)); } catch { /* la facture suivra */ } }
       const info = { customer: o.customer, subscription: o.subscription, periodEnd: pe, paid: o.payment_status === 'paid' };
-      if (o.metadata?.boutique) await attachToBoutique(env, o.metadata.boutique, info);
-      else if (o.metadata?.inscription) await finalizeInscription(env, o.metadata.inscription, info);
-      break;
+      let bid = null;
+      if (o.metadata?.boutique) { bid = o.metadata.boutique; await attachToBoutique(env, bid, info); }
+      else if (o.metadata?.inscription) bid = await finalizeInscription(env, o.metadata.inscription, info);
+      else return { handled: false };
+      await audit(env, bid, 'stripe', 'abonnement.souscrit', o.subscription);
+      return { boutiqueId: bid, handled: true };
     }
     case 'invoice.paid': {
       const subId = invoiceSubscription(o);
       const pe = invoicePeriodEnd(o);
-      if (!subId) break;
+      if (!subId) return { handled: false };
       const b = await bySub(subId);
       if (b) {
-        await env.DB.prepare(`UPDATE boutiques SET statut = 'active', date_echeance = ? WHERE id = ?`).bind(new Date(pe || Date.now() + 30 * 86400000).toISOString(), b.id).run();
-      } else {
-        const meta = invoiceMetadata(o);
-        const info = { customer: o.customer, subscription: subId, periodEnd: pe, paid: true };
-        if (meta.boutique) await attachToBoutique(env, meta.boutique, info);
-        else if (meta.inscription) await finalizeInscription(env, meta.inscription, info);
+        await env.DB.prepare(`UPDATE boutiques SET statut = 'active', abonnement_statut = 'actif', date_echeance = ? WHERE id = ?`)
+          .bind(new Date(pe || Date.now() + 30 * 86400000).toISOString(), b.id).run();
+        await audit(env, b.id, 'stripe', 'abonnement.paye', o.id);
+        return { boutiqueId: b.id, handled: true };
       }
-      break;
+      const meta = invoiceMetadata(o);
+      const info = { customer: o.customer, subscription: subId, periodEnd: pe, paid: true };
+      let bid = null;
+      if (meta.boutique) { bid = meta.boutique; await attachToBoutique(env, bid, info); }
+      else if (meta.inscription) bid = await finalizeInscription(env, meta.inscription, info);
+      return { boutiqueId: bid, handled: !!bid };
+    }
+    case 'invoice.payment_failed': {
+      // Stripe relance le client ; la boutique reste en ligne jusqu'à l'échéance + délai de grâce (tâche planifiée).
+      const b = await bySub(invoiceSubscription(o));
+      if (!b) return { handled: false };
+      await env.DB.prepare(`UPDATE boutiques SET abonnement_statut = 'impaye' WHERE id = ?`).bind(b.id).run();
+      await audit(env, b.id, 'stripe', 'abonnement.echec_paiement', o.id);
+      return { boutiqueId: b.id, handled: true };
     }
     case 'customer.subscription.updated': {
       const b = await bySub(o.id);
-      if (!b) break;
+      if (!b) return { handled: false };
       const price = o.items?.data?.[0]?.price?.metadata || {};
       const stopped = ['canceled', 'unpaid', 'incomplete_expired'].includes(o.status);
       const pe = periodEnd(o);
       await env.DB.prepare(`UPDATE boutiques SET plan = COALESCE(?, plan), cycle = COALESCE(?, cycle), statut = CASE WHEN ? THEN 'suspendue' ELSE statut END,
-          date_echeance = COALESCE(?, date_echeance) WHERE id = ?`)
+          abonnement_statut = CASE WHEN ? THEN 'impaye' ELSE abonnement_statut END, date_echeance = COALESCE(?, date_echeance) WHERE id = ?`)
         .bind(PLANS[price.plan] ? price.plan : null, ['mensuel', 'annuel'].includes(price.cycle) ? price.cycle : null, stopped ? 1 : 0,
-          !stopped && pe ? new Date(pe).toISOString() : null, b.id).run();
-      break;
+          o.status === 'past_due' ? 1 : 0, !stopped && pe ? new Date(pe).toISOString() : null, b.id).run();
+      await audit(env, b.id, 'stripe', 'abonnement.modifie', `${o.status || ''} ${price.plan || ''} ${price.cycle || ''}`.trim());
+      return { boutiqueId: b.id, handled: true };
     }
     case 'customer.subscription.deleted': {
       const b = await bySub(o.id);
-      if (b) await env.DB.prepare(`UPDATE boutiques SET statut = 'suspendue' WHERE id = ?`).bind(b.id).run();
-      break;
+      if (!b) return { handled: false };
+      await env.DB.prepare(`UPDATE boutiques SET statut = 'suspendue' WHERE id = ?`).bind(b.id).run();
+      await audit(env, b.id, 'stripe', 'abonnement.resilie', o.id);
+      return { boutiqueId: b.id, handled: true };
     }
-    default: break; // invoice.payment_failed : Stripe relance le client ; la tâche planifiée suspend après l'échéance + délai de grâce
+    default: return { handled: false };
   }
-  return Response.json({ recu: true });
 }
 
 // ───────────────────────────── Générateur IA ─────────────────────────────
@@ -579,7 +639,10 @@ async function dashboard(request, env, url, b, who, sub) {
   if (!section) return dashHome(env, url, b);
   if (section === 'parametres') return post ? settingsPost(request, env, b) : settingsForm(url, b);
   if (section === 'apparence') return post ? appearancePost(request, env, b) : appearanceForm(env, url, b);
-  if (section === 'osb') return post ? osbPost(request, env, b, who) : osbForm(env, url, b, who);
+  if (section === 'osb') {
+    if (id === 'piece' && action && !post) return servePiece(env, action, b.id);
+    return post ? osbPost(request, env, b, who) : osbForm(env, url, b, who);
+  }
   if (section === 'abonnement' && post) return subscriptionAction(env, url, b, who, id);
   if (section === 'produits') {
     if (!id) return post ? productSave(request, env, b, null) : productList(env, url, b);
@@ -607,7 +670,9 @@ async function dashHome(env, url, b) {
     [!!(b.logo_url || b.slogan), 'Personnalisez votre vitrine (logo, accroche, sections)', '/tableau-de-bord/apparence'],
   ].filter((s) => !s[0]);
   const surplus = Math.max(0, u.ventes - plan.salesQuota);
-  const body = `${flash(url)}
+  const impaye = b.abonnement_statut === 'impaye' && b.statut !== 'suspendue'
+    ? `<div class="card" role="alert"><b>Paiement de l’abonnement refusé.</b> Mettez à jour votre carte avant le ${fmtDate(addDays(b.date_echeance || nowIso(), int(env.GRACE_DAYS, 3)))} pour que votre boutique reste en ligne.</div>` : '';
+  const body = `${flash(url)}${impaye}
   ${offline ? '<div class="flash err"><b>Votre boutique est hors ligne</b> : l’abonnement n’est pas à jour. Réglez-le pour la remettre en ligne aussitôt.</div>' : ''}
   <div class="card">
     <h1>${esc(b.nom)}</h1>
@@ -924,45 +989,106 @@ async function orderDelete(env, b, id) {
 
 async function osbForm(env, url, b, who) {
   const { results } = await env.DB.prepare('SELECT * FROM dossiers_osb WHERE boutique_id = ? ORDER BY cree_le DESC').bind(b.id).all();
-  const body = `${flash(url)}<div class="card"><h1>Paiement par carte (OSB)</h1>
-    <p>Pour accepter la carte bancaire, votre boutique a besoin d’un contrat de paiement en ligne auprès d’OSB, ouvert à votre nom. Remplissez ce dossier : nous le préparons avec vous et le transmettons.</p>
-    <p class="small muted">L’abonnement OSB est réglé directement par vous à OSB ; il n’est pas inclus dans votre formule Hinova.</p></div>
-  ${results.length ? `<div class="card"><h2>Mes demandes</h2><table><tbody>${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.raison_sociale)}</td><td><span class="badge ${esc(d.statut)}">${esc(OSB_STATUTS[d.statut] || d.statut)}</span></td></tr>`).join('')}</tbody></table></div>` : ''}
-  <div class="card"><h2>Nouvelle demande</h2><form method="post">
+  const { results: pieces } = await env.DB.prepare('SELECT id, dossier_id, nature, nom_fichier FROM osb_justificatifs WHERE boutique_id = ? ORDER BY cree_le').bind(b.id).all();
+  const piecesOf = (d) => pieces.filter((x) => x.dossier_id === d.id)
+    .map((x) => `<a class="small" href="/tableau-de-bord/osb/piece/${x.id}">${esc(OSB_PIECES[x.nature] || x.nature)}</a>`).join('<br>');
+  const pieceInput = (k) => `<label for="p_${k}">${esc(OSB_PIECES[k])}${k === 'autre' ? ' (facultatif)' : ''}</label>
+    <input id="p_${k}" name="piece_${k}" type="file" accept="application/pdf,image/jpeg,image/png" ${k === 'autre' ? '' : 'required'}>`;
+  const body = `${flash(url)}<div class="card"><h1>Paiement en ligne par carte (OSB / PayZen)</h1>
+    <p>Pour accepter la carte bancaire, votre boutique a besoin d’un contrat de paiement en ligne OSB, ouvert à votre nom, adossé à un compte professionnel à la <b>Banque de Polynésie</b> ou à la <b>Socredo</b>. Remplissez ce dossier avec les justificatifs : nous le vérifions et le transmettons à OSB.</p>
+    <p><b>Frais de constitution du dossier : ${fmtXpf(PAYZEN_OPTION.fraisXpf)}</b>, facturés par Hinova Digital.</p>
+    <p class="small muted">Le contrat et l’abonnement OSB sont réglés directement par vous à OSB ; ils ne sont pas inclus dans votre formule Hinova. Les sommes payées par vos clients arrivent sur votre compte, jamais chez Hinova.</p></div>
+  ${results.length ? `<div class="card"><h2>Mes demandes</h2><table><tbody>${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.raison_sociale)}<br>${piecesOf(d)}</td><td><span class="badge ${esc(d.statut)}">${esc(OSB_STATUTS[d.statut] || d.statut)}</span></td></tr>`).join('')}</tbody></table></div>` : ''}
+  <div class="card"><h2>Nouvelle demande</h2><form method="post" enctype="multipart/form-data">
     <div class="row">
       <div><label for="rs">Raison sociale ou nom commercial</label><input id="rs" name="raison_sociale" required maxlength="120" value="${esc(b.nom)}"></div>
-      <div><label for="nt">N° Tahiti</label><input id="nt" name="numero_tahiti" maxlength="20" value="${esc(b.numero_tahiti || '')}"></div>
+      <div><label for="nt">N° Tahiti</label><input id="nt" name="numero_tahiti" required maxlength="20" value="${esc(b.numero_tahiti || '')}"></div>
     </div>
     <div class="row">
       <div><label for="re">Responsable</label><input id="re" name="responsable" required maxlength="80"></div>
       <div><label for="te">Téléphone</label><input id="te" name="telephone" required maxlength="30" value="${esc(b.telephone || '')}"></div>
       <div><label for="em">E-mail</label><input id="em" name="email" type="email" required maxlength="120" value="${esc(who.email)}"></div>
     </div>
-    <label for="bq">Banque du compte professionnel</label><select id="bq" name="banque" required>${BANQUES.map((x) => `<option ${x === b.banque ? 'selected' : ''}>${x}</option>`).join('')}</select>
-    <button class="btn" type="submit">Envoyer la demande</button></form></div>`;
+    <label for="bq">Banque du compte professionnel</label><select id="bq" name="banque" required>${BANQUES_OSB.map((x) => `<option ${x === b.banque ? 'selected' : ''}>${x}</option>`).join('')}</select>
+    <h3>Justificatifs</h3><p class="small muted">PDF, JPG ou PNG, 5 Mo maximum par fichier. Ils sont conservés en accès privé, visibles par vous et par l’équipe Hinova uniquement.</p>
+    ${Object.keys(OSB_PIECES).map(pieceInput).join('')}
+    <label class="check"><input type="checkbox" name="consentement" required> J’autorise Hinova Digital à conserver ces informations et justificatifs pour préparer et transmettre mon dossier à OSB, et j’accepte les frais de ${fmtXpf(PAYZEN_OPTION.fraisXpf)}.</label>
+    <button class="btn" type="submit">Envoyer le dossier</button></form></div>`;
   return dash('Paiement carte', '/tableau-de-bord/osb', body);
 }
 
-async function osbPost(request, env, b) {
+async function osbPost(request, env, b, who) {
   const f = await readForm(request);
+  const back = (m) => redirect(withMsg('/tableau-de-bord/osb', 'err', m));
   const d = {
     raison_sociale: clean(f.get('raison_sociale'), 120), numero_tahiti: clean(f.get('numero_tahiti'), 20),
     responsable: clean(f.get('responsable'), 80), telephone: clean(f.get('telephone'), 30),
-    email: clean(f.get('email'), 120).toLowerCase(), banque: BANQUES.includes(f.get('banque')) ? f.get('banque') : '',
+    email: clean(f.get('email'), 120).toLowerCase(), banque: BANQUES_OSB.includes(f.get('banque')) ? f.get('banque') : '',
   };
-  if (!d.raison_sociale || !d.responsable || !d.telephone || !isEmail(d.email) || !d.banque) {
-    return redirect(withMsg('/tableau-de-bord/osb', 'err', 'Merci de remplir tous les champs obligatoires.'));
+  if (!d.raison_sociale || !d.numero_tahiti || !d.responsable || !d.telephone || !isEmail(d.email) || !d.banque) {
+    return back('Merci de remplir tous les champs obligatoires (OSB n’accepte que la Banque de Polynésie et la Socredo).');
   }
+  if (!f.get('consentement')) return back('Merci de cocher l’autorisation de traitement du dossier.');
+  // Vérification de tous les fichiers avant d'écrire quoi que ce soit.
+  const files = [];
+  for (const nature of Object.keys(OSB_PIECES)) {
+    const file = f.get(`piece_${nature}`);
+    const present = file && typeof file !== 'string' && file.size > 0;
+    if (!present) { if (nature !== 'autre') return back(`Justificatif manquant : ${OSB_PIECES[nature]}.`); continue; }
+    const ext = PIECE_TYPES[file.type];
+    if (!ext) return back(`Format non accepté pour « ${OSB_PIECES[nature]} » (PDF, JPG ou PNG).`);
+    if (file.size > MAX_PIECE) return back(`Fichier trop lourd pour « ${OSB_PIECES[nature]} » (5 Mo maximum).`);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (!magicOk(bytes, ext)) return back(`Le fichier « ${OSB_PIECES[nature]} » ne correspond pas à son format.`);
+    files.push({ nature, ext, bytes, type: file.type, name: clean(file.name, 120).replace(/[^\p{L}\p{N}._ -]/gu, '_') || `piece.${ext}` });
+  }
+  if (files.length > MAX_PIECES) return back('Trop de fichiers.');
+
   const id = uid();
-  await env.DB.prepare(`INSERT INTO dossiers_osb (id, boutique_id, raison_sociale, numero_tahiti, responsable, telephone, email, banque)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, b.id, d.raison_sociale, d.numero_tahiti, d.responsable, d.telephone, d.email, d.banque).run();
-  if (env.OSB_WEBHOOK_URL) {
-    try {
-      await fetch(env.OSB_WEBHOOK_URL, { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'dossier_osb', id, boutique: { id: b.id, nom: b.nom, domaine: b.domaine }, ...d, cree_le: nowIso() }) });
-    } catch (e) { console.error('Webhook OSB en échec', e); }
+  const stored = [];
+  try {
+    for (const x of files) {
+      const key = `prive/osb/${b.id}/${id}/${uid()}.${x.ext}`;
+      await env.IMAGES.put(key, x.bytes, { httpMetadata: { contentType: x.type } });
+      stored.push({ ...x, key });
+    }
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO dossiers_osb (id, boutique_id, raison_sociale, numero_tahiti, responsable, telephone, email, banque, paiement_en_ligne, frais_xpf, consentement_le)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).bind(id, b.id, d.raison_sociale, d.numero_tahiti, d.responsable, d.telephone, d.email, d.banque, PAYZEN_OPTION.fraisXpf, nowIso()),
+      ...stored.map((x) => env.DB.prepare(`INSERT INTO osb_justificatifs (dossier_id, boutique_id, nature, cle_r2, nom_fichier, type_mime, taille) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .bind(id, b.id, x.nature, x.key, x.name, x.type, x.bytes.length)),
+    ]);
+  } catch (e) {
+    console.error('Dossier OSB non enregistré', e && e.message);
+    for (const x of stored) await env.IMAGES.delete(x.key).catch(() => {});
+    return back('Le dossier n’a pas pu être enregistré. Réessayez dans un instant.');
   }
-  return redirect(withMsg('/tableau-de-bord/osb', 'ok', 'Demande envoyée. Nous revenons vers vous rapidement.'));
+  // Aucune donnée n'est envoyée à un service externe : le dossier est traité depuis l'administration Hinova.
+  await audit(env, b.id, who?.email, 'osb.dossier_depose', `${stored.length} justificatif(s)`);
+  return redirect(withMsg('/tableau-de-bord/osb', 'ok', 'Dossier envoyé. Nous le vérifions et revenons vers vous rapidement.'));
+}
+
+// Contrôle de la signature des fichiers (le type annoncé par le navigateur ne suffit pas).
+function magicOk(b, ext) {
+  if (ext === 'pdf') return b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46;
+  if (ext === 'png') return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+  if (ext === 'jpg') return b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  return false;
+}
+
+// Justificatif privé : servi uniquement au commerçant propriétaire (boutiqueId) ou à l'administration (boutiqueId = null).
+async function servePiece(env, pieceId, boutiqueId) {
+  if (!/^[a-f0-9]{32}$/.test(pieceId)) return notFound();
+  const p = boutiqueId
+    ? await env.DB.prepare('SELECT * FROM osb_justificatifs WHERE id = ? AND boutique_id = ?').bind(pieceId, boutiqueId).first()
+    : await env.DB.prepare('SELECT * FROM osb_justificatifs WHERE id = ?').bind(pieceId).first();
+  if (!p) return notFound();
+  const obj = await env.IMAGES.get(p.cle_r2);
+  if (!obj) return notFound();
+  return new Response(obj.body, { headers: {
+    'content-type': p.type_mime, 'content-disposition': `attachment; filename="${p.nom_fichier.replace(/"/g, '')}"`,
+    'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff', 'x-robots-tag': 'noindex',
+  } });
 }
 
 // ───────────────────────────── Vitrines ─────────────────────────────
@@ -1097,6 +1223,7 @@ async function admin(request, env, url, sub) {
   if (sub[0] === 'b' && sub[1] && sub[2] && post) return adminBoutiqueAction(request, env, sub[1], sub[2]);
   if (sub[0] === 'osb') {
     if (sub[1] && sub[2] === 'statut' && post) return adminOsbStatus(request, env, sub[1]);
+    if (sub[1] === 'piece' && sub[2] && !post) return servePiece(env, sub[2], null);
     return adminOsb(env, url);
   }
   const now = nowIso();
@@ -1152,14 +1279,17 @@ async function adminBoutiqueAction(request, env, id, action) {
     await env.DB.prepare(`UPDATE boutiques SET statut = 'active', date_echeance = ? WHERE id = ?`).bind(until, id).run();
     msg = `${b.nom} : réactivée.`;
   } else return notFound();
+  await audit(env, id, 'admin', `admin.${action}`, msg);
   return redirect(withMsg('/admin', 'ok', msg));
 }
 
 async function adminOsb(env, url) {
   const { results } = await env.DB.prepare(`SELECT d.*, b.nom AS boutique FROM dossiers_osb d JOIN boutiques b ON b.id = d.boutique_id ORDER BY d.cree_le DESC LIMIT 200`).all();
+  const { results: pieces } = await env.DB.prepare(`SELECT id, dossier_id, nature FROM osb_justificatifs WHERE dossier_id IN (SELECT id FROM dossiers_osb ORDER BY cree_le DESC LIMIT 200)`).all();
+  const piecesOf = (d) => pieces.filter((x) => x.dossier_id === d.id).map((x) => `<a class="small" href="/admin/osb/piece/${x.id}">${esc(OSB_PIECES[x.nature] || x.nature)}</a>`).join('<br>');
   const body = `${flash(url)}<div class="card"><h1>Dossiers OSB</h1>${results.length ? `<div class="table-scroll"><table><thead><tr><th>Date</th><th>Boutique</th><th>Demandeur</th><th>Banque</th><th>Statut</th></tr></thead><tbody>
     ${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.boutique)}<br><span class="small muted">${esc(d.raison_sociale)} · ${esc(d.numero_tahiti || 's. n° Tahiti')}</span></td>
-      <td>${esc(d.responsable)}<br><span class="small muted">${esc(d.telephone)} · ${esc(d.email)}</span></td><td>${esc(d.banque)}</td>
+      <td>${esc(d.responsable)}<br><span class="small muted">${esc(d.telephone)} · ${esc(d.email)}</span></td><td>${esc(d.banque)}${d.paiement_en_ligne ? `<br><span class="small">PayZen · ${fmtXpf(d.frais_xpf || 0)}</span>` : ''}<br>${piecesOf(d)}</td>
       <td><form method="post" action="/admin/osb/${d.id}/statut" style="display:flex;gap:6px"><select name="statut" style="width:auto">${Object.entries(OSB_STATUTS).map(([k, v]) => `<option value="${k}" ${k === d.statut ? 'selected' : ''}>${v}</option>`).join('')}</select><button class="btn small ghost">OK</button></form></td></tr>`).join('')}
     </tbody></table></div>` : '<p class="muted">Aucun dossier.</p>'}</div>`;
   return html(appPage({ title: 'Dossiers OSB', body, nav: adminNav('/admin/osb'), brandHref: '/admin' }), 200, { 'cache-control': 'no-store' });
@@ -1168,7 +1298,10 @@ async function adminOsb(env, url) {
 async function adminOsbStatus(request, env, id) {
   const f = await readForm(request);
   const st = OSB_STATUTS[f.get('statut')] ? f.get('statut') : null;
-  if (st) await env.DB.prepare('UPDATE dossiers_osb SET statut = ? WHERE id = ?').bind(st, id).run();
+  if (st) {
+    const r = await env.DB.prepare('UPDATE dossiers_osb SET statut = ? WHERE id = ? RETURNING boutique_id').bind(st, id).first();
+    if (r) await audit(env, r.boutique_id, 'admin', 'osb.statut', st);
+  }
   return redirect(withMsg('/admin/osb', 'ok', 'Dossier mis à jour.'));
 }
 

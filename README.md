@@ -25,7 +25,7 @@ Plateforme de boutiques en ligne pour la Polynésie française. Un seul Worker C
 | Commandes | Réservation de stock atomique, instructions de paiement, bon de commande + étiquette postale imprimables |
 | Factures | Numéro séquentiel par boutique (`compteurs_factures`) émis au paiement, page facture imprimable, envoi par e-mail ou WhatsApp |
 | Quotas | Ventes payées comptées par mois (`ventes_mensuelles`) ; dépassement signalé |
-| Dossier OSB | Formulaire commerçant → `dossiers_osb` + webhook `OSB_WEBHOOK_URL` ; suivi des statuts dans l'admin |
+| Dossier OSB | Formulaire commerçant (Banque de Polynésie ou Socredo) + justificatifs privés dans R2 (`prive/`), consentement daté, frais PayZen 2 200 XPF ; traité depuis l'admin, aucune transmission externe |
 | Admin | Boutiques, revenu mensuel récurrent, encaisser +1 / +12 mois, changer de formule, suspendre / réactiver, dossiers OSB |
 | Suspension | Tâche planifiée quotidienne : échéance dépassée + 3 jours → hors ligne |
 | Sécurité | Échappement HTML partout, contrôle d'origine sur les POST, cookies HttpOnly / Secure / SameSite, isolation par boutique dans chaque requête, redirections internes uniquement, anti-robots |
@@ -41,8 +41,8 @@ URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback
 1. `npm install` puis `npx wrangler login`
 2. `npx wrangler d1 create hinova_boutiques` → copier l'`database_id` dans `wrangler.toml`
 3. `npx wrangler r2 bucket create hinova-boutiques-images`
-4. `npm run db:remote` (applique `migrations/0001` puis `0002`)
-5. Secret obligatoire pour encaisser : `STRIPE_SECRET_KEY` (clé secrète ou clé restreinte Stripe). Facultatifs : `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OSB_WEBHOOK_URL`
+4. `npm run db:remote` (applique `migrations/0001` à `0004`)
+5. Secret obligatoire pour encaisser : `STRIPE_SECRET_KEY` (clé secrète ou clé restreinte Stripe). Obligatoire aussi : `STRIPE_WEBHOOK_SECRET`. Facultatifs : `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
 6. `wrangler.toml` : `ADMIN_EMAILS` et les 6 prix `STRIPE_PRICE_*` (déjà renseignés). Webhook Stripe : `https://<app>/api/stripe/webhook` (événements checkout.session.completed, invoice.paid, invoice.payment_failed, customer.subscription.updated, customer.subscription.deleted)
 7. `npm run deploy`
 
@@ -54,7 +54,9 @@ URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback
 
 **E. Juridique** : CGU de l'abonnement, mentions légales, politique de confidentialité (validées par la juriste).
 
-> Ne jamais définir `DEV_LOGIN` en production : il permet de se connecter sans Google.
+> `DEV_LOGIN` et l'inscription sans paiement ne fonctionnent qu'avec `ENVIRONMENT = "test"` (environnement `--env test`). En production (`ENVIRONMENT = "production"`), une clé Stripe absente bloque les inscriptions au lieu de créer des boutiques gratuites.
+
+Conformité (RGPD, localisation des données, ISO 27001) : voir `docs/CONFORMITE.md`.
 
 **Workers AI** : la liaison `AI` est déclarée dans `wrangler.toml`. Chaque génération consomme des « neurones » Workers AI ; l'offre gratuite en couvre un volume quotidien limité (voir la page de tarification Workers AI). Ajouter une règle de limitation de débit (WAF) sur `POST /api/generer`.
 
@@ -67,9 +69,10 @@ cat > .dev.vars <<'EOF'
 SESSION_SECRET="dev-secret-0123456789abcdef0123456789abcdef"
 DEV_LOGIN="1"
 ADMIN_EMAILS="admin@test.pf"
+STRIPE_WEBHOOK_SECRET="whsec_test_local_123"
 EOF
 npm run dev                            # http://localhost:8787 (environnement « test », sans Workers AI : la proposition automatique est utilisée)
-BASE=http://localhost:8787 npm test    # 76 vérifications de bout en bout
+BASE=http://localhost:8787 npm test    # 88 vérifications de bout en bout
 ```
 
 ## Structure
@@ -78,6 +81,7 @@ BASE=http://localhost:8787 npm test    # 76 vérifications de bout en bout
 migrations/0001_initial_schema.sql         Schéma initial (boutiques, utilisateurs, offres, commandes, dossiers OSB, compteurs)
 migrations/0002_sections_contacts_paiements.sql  Ajouts : sections, contacts, moyens de paiement, infos de livraison
 migrations/0003_comptes_et_abonnements_stripe.sql Comptes e-mail, inscriptions en attente de paiement, liens Stripe, configuration
+migrations/0004_securite_paiements_osb.sql   Journal des paiements (idempotence), journal d'audit, impayés, justificatifs OSB
 src/index.js     Routage, connexion Google, tableau de bord, vitrines, factures, admin, tâche planifiée
 src/landing.js   Accueil : générateur IA et carrousel
 src/ai.js        Génération par Workers AI et proposition automatique de secours

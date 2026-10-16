@@ -57,3 +57,17 @@ export const ISLANDS = [
   'Rangiroa', 'Tikehau', 'Fakarava', 'Nuku Hiva', 'Hiva Oa', 'Ua Pou',
   'Tubuai', 'Rurutu', 'Raivavae', 'Rimatara', 'Autre île',
 ];
+
+// Option « paiement en ligne par carte » (PayZen via OSB) : frais Hinova de constitution du dossier.
+// Le contrat et l'abonnement OSB restent réglés directement par le commerçant à OSB.
+export const PAYZEN_OPTION = { label: 'Paiement en ligne par carte (PayZen / OSB)', fraisXpf: 2200 };
+
+// Nature des justificatifs joints au dossier OSB. Liste à aligner sur la liste officielle fournie par OSB.
+export const OSB_PIECES = {
+  identite: 'Pièce d’identité du responsable',
+  rib: 'RIB du compte professionnel (Banque de Polynésie ou Socredo)',
+  immatriculation: 'Justificatif d’immatriculation (n° Tahiti)',
+  autre: 'Autre pièce demandée par OSB',
+};
+// Seules ces banques sont acceptées par OSB pour un contrat de paiement en ligne.
+export const BANQUES_OSB = ['Banque de Polynésie', 'Socredo'];

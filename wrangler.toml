@@ -7,6 +7,7 @@ compatibility_date = "2025-09-01"
 crons = ["0 16 * * *"]
 
 [vars]
+ENVIRONMENT = "production"
 BRAND = "Hinova Boutiques"
 SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
 # Domaine racine des boutiques : <boutique>.ROOT_DOMAIN. Vide = adresses /b/<boutique> uniquement.
@@ -23,7 +24,7 @@ STRIPE_PRICE_PLAN_2_ANNUEL = "price_1UPStCCVrYZbi1ZGWMbzWui5"
 STRIPE_PRICE_PLAN_3_MENSUEL = "price_1UPStECVrYZbi1ZGhEXLuKU7"
 STRIPE_PRICE_PLAN_3_ANNUEL = "price_1UPStFCVrYZbi1ZG47vRMHqJ"
 # Secrets (tableau de bord Cloudflare ou npx wrangler secret put …) : STRIPE_SECRET_KEY (obligatoire pour encaisser),
-# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET (connexion Google, facultative), OSB_WEBHOOK_URL (facultatif).
+# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET (connexion Google, facultative), STRIPE_WEBHOOK_SECRET (obligatoire).
 # Le secret de session et le secret du webhook Stripe sont rangés dans la table config de la base.
 # Ne JAMAIS définir DEV_LOGIN en production (connexion de test sans Google, réservée au poste local).
 
@@ -44,6 +45,7 @@ binding = "AI"
 # Environnement de test local (sans Workers AI, qui exige une connexion au compte) : npx wrangler dev --env test
 [env.test]
 [env.test.vars]
+ENVIRONMENT = "test"
 BRAND = "Hinova Boutiques"
 SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
 ROOT_DOMAIN = ""

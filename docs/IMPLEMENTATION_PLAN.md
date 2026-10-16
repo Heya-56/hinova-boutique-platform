@@ -2,14 +2,23 @@
 
 Chaque phase : tests exécutés, build vérifié, résumé des fichiers, secrets manquants signalés. Pas de phase suivante si un risque critique reste ouvert.
 
-## 0. Décisions à valider avant de coder
-1. **Architecture** : garder Worker mutualisé + D1 (recommandé) ou migrer Supabase + un déploiement par client.
-2. **Grille** : garder Mini 1 500 / Standard 4 900 / Plus 9 900 (9/16/32 produits) ou passer à Essentiel 4 200 / Business 9 900 / Premium 14 500 (6/17/36). Si changement : créer 6 nouveaux prix Stripe et décider du sort des boutiques existantes.
-3. **Quotas de ventes** (50/85/125) : garder ou supprimer.
-4. **Domaine perso** : 20 USD/an ou 2 000 XPF/an (domaine offert la 1re année).
-5. **Registrar** : Cloudflare (recommandé, un seul cloud) ou OVH.
+## 0. Décisions validées (15/10/2026)
+1. Architecture : Worker mutualisé + D1 (pas de Supabase).
+2. Grille : Mini 1 500 / Standard 4 900 / Plus 9 900 XPF (9/16/32 produits) conservée ; option paiement en ligne PayZen avec dossier OSB justifié, 2 200 XPF de frais.
+3. Quotas de ventes 50/85/125 conservés.
+4. Domaine personnalisé : 2 000 XPF/an.
+5. Tout sur Cloudflare, avec données en juridiction UE (RGPD) ; portabilité vers un hébergement souverain polynésien plus tard.
 
-## Phase 1 — Fiabilité des paiements (1er incrément proposé, ~1 jour)
+## Phase 1 — Fiabilité des paiements et dossier OSB : FAITE (88/88 tests)
+- Migration `0004` : `paiements_evenements`, `journal_audit`, `abonnement_statut`, `osb_justificatifs`.
+- Webhook idempotent, `invoice.payment_failed` géré, audit des événements.
+- Inscription sans paiement et connexion de test bloquées hors `ENVIRONMENT = "test"`.
+- Dossier OSB : justificatifs privés, consentement daté, frais PayZen, plus aucun envoi externe.
+
+## Phase 1 bis — Données en UE (avant mise en production)
+- Nouvelle base D1 et nouveau bucket R2 en juridiction `eu`, transfert, bascule (voir CONFORMITE.md §2).
+
+## (archive) Périmètre initial de la phase 1
 - Migration `0004` : `paiements_evenements` (event_id unique, type, boutique_id, payload résumé, traité_le), `journal_audit`.
 - Webhook : idempotence, `invoice.payment_failed` → `impayee`, journalisation.
 - `/demarrer` : plus de boutique gratuite hors environnement de test (S1) ; `DEV_LOGIN` verrouillé (S4).

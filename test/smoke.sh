@@ -98,10 +98,23 @@ check "commande en attente supprimée, stock remis (0 → 1)" 'curl -s -b "$J" $
 curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/$CMD/supprimer"
 check "commande payée non supprimable" '[ "$(code $BASE/f/$CMD)" = 200 ]'
 
-echo "7. Dossier OSB"
-curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/osb" --data-urlencode "raison_sociale=Boutique Test" -d numero_tahiti=A12345 \
-  --data-urlencode "responsable=Hina T" -d telephone=89000000 -d email=$EMAIL --data-urlencode "banque=Socredo"
-check "dossier OSB enregistré" 'curl -s -b "$J" $BASE/tableau-de-bord/osb | grep -q "En attente"'
+echo "7. Dossier OSB (justificatifs privés)"
+printf '%%PDF-1.4\n%%test\n' > "$TMP/id.pdf"; printf '%%PDF-1.4\n%%rib\n' > "$TMP/rib.pdf"; printf '%%PDF-1.4\n%%imm\n' > "$TMP/imm.pdf"
+printf 'pas un pdf' > "$TMP/faux.pdf"
+osb(){ curl -s -o /dev/null -w '%{redirect_url}' -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/osb" -F "raison_sociale=Boutique Test" -F numero_tahiti=A12345 \
+  -F "responsable=Hina T" -F telephone=89000000 -F email=$EMAIL -F "banque=$1" -F "piece_identite=@$2;type=application/pdf" \
+  -F "piece_rib=@$TMP/rib.pdf;type=application/pdf" -F "piece_immatriculation=@$TMP/imm.pdf;type=application/pdf" ${3:-}; }
+check "dossier OSB : banque hors Banque de Polynésie / Socredo refusée" '[[ "$(osb "Banque de Tahiti" "$TMP/id.pdf" "-F consentement=on")" == *err=* ]]'
+check "dossier OSB : consentement obligatoire" '[[ "$(osb Socredo "$TMP/id.pdf")" == *err=* ]]'
+check "dossier OSB : faux PDF refusé" '[[ "$(osb Socredo "$TMP/faux.pdf" "-F consentement=on")" == *err=* ]]'
+check "dossier OSB complet enregistré" '[[ "$(osb Socredo "$TMP/id.pdf" "-F consentement=on")" == *ok=* ]]'
+OSBP=$(curl -s -b "$J" $BASE/tableau-de-bord/osb)
+check "dossier OSB en attente, frais PayZen affichés" 'echo "$OSBP" | grep -q "En attente" && echo "$OSBP" | grep -q "2"$'"'"'\xc2\xa0'"'"'"200"'
+PIECE=$(echo "$OSBP" | grep -o '/tableau-de-bord/osb/piece/[a-f0-9]\{32\}' | head -1 | sed 's#.*/##')
+check "justificatif téléchargeable par son propriétaire" '[ "$(code -b "$J" $BASE/tableau-de-bord/osb/piece/$PIECE)" = 200 ]'
+check "justificatif invisible pour une autre boutique" '[ "$(code -b "$J2" $BASE/tableau-de-bord/osb/piece/$PIECE)" = 404 ]'
+check "justificatif invisible sans connexion" '[ "$(code $BASE/tableau-de-bord/osb/piece/$PIECE)" != 200 ]'
+check "justificatif non servi par le chemin public des images" '[ "$(code "$BASE/img/prive%2Fosb%2F$PIECE")" = 404 ]'
 
 echo "8. Administration"
 check "admin interdit aux commerçants" '[ "$(code -b "$J" $BASE/admin)" = 404 ]'
@@ -141,15 +154,24 @@ hook(){ local t=$(date +%s); local sig=$(printf '%s' "$t.$1" | openssl dgst -sha
 check "webhook sans signature refusé" '[ "$(code -X POST -H "content-type: application/json" -d "{}" $BASE/api/stripe/webhook)" = 400 ]'
 check "webhook mal signé refusé" '[ "$(code -X POST -H "stripe-signature: t=$(date +%s),v1=abc" -d "{}" $BASE/api/stripe/webhook)" = 400 ]'
 SUB="sub_test_$R"; END=$(( $(date +%s) + 400*86400 ))
-check "paiement Stripe rattaché à la boutique" '[ "$(hook "{\"type\":\"checkout.session.completed\",\"data\":{\"object\":{\"mode\":\"subscription\",\"customer\":\"cus_$R\",\"subscription\":\"$SUB\",\"payment_status\":\"paid\",\"metadata\":{\"boutique\":\"$BID\"}}}}")" = 200 ]'
-hook "{\"type\":\"invoice.paid\",\"data\":{\"object\":{\"customer\":\"cus_$R\",\"parent\":{\"subscription_details\":{\"subscription\":\"$SUB\"}},\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+check "paiement Stripe rattaché à la boutique" '[ "$(hook "{\"id\":\"evt_co_$R\",\"type\":\"checkout.session.completed\",\"data\":{\"object\":{\"mode\":\"subscription\",\"customer\":\"cus_$R\",\"subscription\":\"$SUB\",\"payment_status\":\"paid\",\"metadata\":{\"boutique\":\"$BID\"}}}}")" = 200 ]'
+hook "{\"id\":\"evt_pay_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"customer\":\"cus_$R\",\"parent\":{\"subscription_details\":{\"subscription\":\"$SUB\"}},\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
 Y2=$(TZ=Pacific/Tahiti date -d @$END +%Y)
 check "renouvellement payé → échéance prolongée" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "/$Y2"'
 check "bouton « Gérer mon abonnement » absent tant que Stripe n’est pas branché" '! curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Gérer mon abonnement"'
-hook "{\"type\":\"customer.subscription.deleted\",\"data\":{\"object\":{\"id\":\"$SUB\"}}}" >/dev/null
+hook "{\"id\":\"evt_del_$R\",\"type\":\"customer.subscription.deleted\",\"data\":{\"object\":{\"id\":\"$SUB\"}}}" >/dev/null
 check "résiliation → boutique hors ligne" '[ "$(code $BASE/b/$SLUG)" = 503 ]'
-hook "{\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+PAY2="{\"id\":\"evt_pay2_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}"
+hook "{\"id\":\"evt_pay_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+check "événement déjà traité rejoué → ignoré (boutique reste hors ligne)" '[ "$(code $BASE/b/$SLUG)" = 503 ]'
+check "événement sans identifiant refusé" '[ "$(hook "{\"type\":\"invoice.paid\",\"data\":{\"object\":{}}}")" = 400 ]'
+hook "$PAY2" >/dev/null
 check "nouveau paiement → boutique en ligne" '[ "$(code $BASE/b/$SLUG)" = 200 ]'
+
+hook "{\"id\":\"evt_fail_$R\",\"type\":\"invoice.payment_failed\",\"data\":{\"object\":{\"id\":\"in_$R\",\"subscription\":\"$SUB\"}}}" >/dev/null
+check "échec de paiement → alerte dans le tableau de bord, boutique encore en ligne" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Paiement de l’abonnement refusé" && [ "$(code $BASE/b/$SLUG)" = 200 ]'
+hook "{\"id\":\"evt_pay3_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
+check "paiement régularisé → alerte levée" '! curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Paiement de l’abonnement refusé"'
 
 echo "11. Session"
 curl -s -o /dev/null -c "$J" "$BASE/deconnexion"
