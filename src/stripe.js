@@ -80,7 +80,10 @@ export async function verifyWebhook(payload, header, secret, toleranceSec = 300)
 // Ajout d'une option mensuelle (ligne supplémentaire) à un abonnement existant. Clé d'idempotence : un seul ajout par abonnement et prix.
 export async function addSubscriptionItem(env, subscription, price) {
   const sub = await getSubscription(env, subscription);
-  if ((sub.items?.data || []).some((it) => it.price?.id === price)) return { deja: true };
+  const items = sub.items?.data || [];
+  if (items.some((it) => it.price?.id === price)) return { deja: true };
+  // Stripe refuse de mélanger des périodicités : une option mensuelle ne s'ajoute pas à un abonnement annuel.
+  if (items.some((it) => it.price?.recurring?.interval && it.price.recurring.interval !== 'month')) return { annuel: true };
   const init = { method: 'POST', headers: { authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, 'content-type': 'application/x-www-form-urlencoded', 'idempotency-key': `item-${subscription}-${price}` } };
   init.body = formEncode({ subscription, price, quantity: 1, proration_behavior: 'create_prorations' }).toString();
   const res = await fetch(API + '/subscription_items', init);

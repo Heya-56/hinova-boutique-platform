@@ -4,7 +4,7 @@ Chaque phase : tests exécutés, build vérifié, résumé des fichiers, secrets
 
 ## 0. Décisions validées (15/10/2026)
 1. Architecture : Worker mutualisé + D1 (pas de Supabase).
-2. Grille : Mini 1 500 / Standard 4 900 / Plus 9 900 XPF (9/16/32 produits) conservée ; option paiement en ligne PayZen avec dossier OSB justifié, **2 200 XPF par mois**, ajoutée à l'abonnement Stripe à la validation du dossier (prix Stripe `STRIPE_PRICE_OPTION_PAYZEN` à créer).
+2. Grille : Mini 1 500 / Standard 4 900 / Plus 9 900 XPF (9/16/32 produits) conservée ; option paiement en ligne PayZen avec dossier OSB justifié, **2 200 XPF par mois**, ajoutée à l'abonnement Stripe à la validation du dossier (prix Stripe `price_1UR31eCVrYZbi1ZGheJAKAPz`, créé le 15/10/2026 ; abonnements annuels : option à facturer à part).
 3. Quotas de ventes 50/85/125 conservés.
 4. Domaine personnalisé : 2 000 XPF/an.
 5. Tout sur Cloudflare, avec données en juridiction UE (RGPD) ; portabilité vers un hébergement souverain polynésien plus tard.

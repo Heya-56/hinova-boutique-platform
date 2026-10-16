@@ -520,7 +520,7 @@ async function handleStripeEvent(env, evt, o) {
     case 'customer.subscription.updated': {
       const b = await bySub(o.id);
       if (!b) return { handled: false };
-      const price = o.items?.data?.[0]?.price?.metadata || {};
+      const price = (o.items?.data || []).map((it) => it.price?.metadata || {}).find((m) => m.plan) || {}; // ignore les options (ex. PayZen)
       const stopped = ['canceled', 'unpaid', 'incomplete_expired'].includes(o.status);
       const pe = periodEnd(o);
       await env.DB.prepare(`UPDATE boutiques SET plan = COALESCE(?, plan), cycle = COALESCE(?, cycle), statut = CASE WHEN ? THEN 'suspendue' ELSE statut END,
@@ -1319,6 +1319,10 @@ async function activerOptionPayzen(env, boutiqueId) {
   }
   try {
     const r = await addSubscriptionItem(env, b.stripe_subscription_id, price);
+    if (r.annuel) {
+      await audit(env, boutiqueId, 'admin', 'osb.option_a_facturer', 'Abonnement annuel : option mensuelle à facturer à part');
+      return '⚠ Dossier validé. Abonnement annuel : l’option PayZen mensuelle ne peut pas y être ajoutée, à facturer à part.';
+    }
     await audit(env, boutiqueId, 'admin', 'osb.option_activee', r.deja ? 'déjà présente' : 'ajoutée à l’abonnement');
     return r.deja ? 'Dossier validé. L’option PayZen était déjà sur l’abonnement.' : 'Dossier validé. Option PayZen ajoutée à l’abonnement.';
   } catch (e) {
