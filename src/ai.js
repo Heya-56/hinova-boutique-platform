@@ -8,6 +8,7 @@ import { DEMOS } from './demo.js';
 import { heroPhoto } from './photos.js';
 
 const MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const VISION_MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
 const AI_TIMEOUT_MS = 25000;
 
 const SCHEMA = {
@@ -145,4 +146,28 @@ export async function generateShop(env, description, nom) {
     } catch (e) { console.error('Génération IA en échec, secours activé :', e && e.message); }
   }
   return fallbackGen(description, nom);
+}
+
+// ───────────── Lecture d'une image (capture de page Facebook / Instagram, photo de produits, vitrine…) ─────────────
+// L'image n'est jamais enregistrée : elle est lue en mémoire, analysée, puis oubliée.
+const VISION_PROMPT = `Cette image vient d'un commerçant ou artisan de Polynésie française (capture d'écran de sa page de réseau social, photo de ses produits, de sa boutique ou de son logo).
+Réponds uniquement en JSON, en français, avec : {"nom": nom de la boutique s'il est lisible sinon "", "activite": une phrase décrivant l'activité et les produits, "produits": [jusqu'à 6 noms de produits visibles], "couleurs": [2 couleurs dominantes de la marque en #RRGGBB]}.
+N'invente rien qui ne soit pas visible.`;
+
+export async function readImage(env, bytes, type) {
+  if (!env.AI || env.AI_OFF === '1') return null;
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  const run = env.AI.run(VISION_MODEL, {
+    messages: [{ role: 'user', content: VISION_PROMPT }], image: `data:${type};base64,${btoa(bin)}`, max_tokens: 400, temperature: 0.2,
+  });
+  const res = await Promise.race([run, new Promise((_, rej) => setTimeout(() => rej(new Error('Lecture d’image trop lente')), AI_TIMEOUT_MS))]);
+  let out = res?.response ?? res;
+  if (typeof out === 'string') out = JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1));
+  if (!out || typeof out !== 'object') return null;
+  const couleurs = (Array.isArray(out.couleurs) ? out.couleurs : []).filter(isColor).slice(0, 2);
+  return {
+    nom: clean(out.nom, 60), activite: clean(out.activite, 300),
+    produits: (Array.isArray(out.produits) ? out.produits : []).map((x) => clean(x, 60)).filter(Boolean).slice(0, 6), couleurs,
+  };
 }

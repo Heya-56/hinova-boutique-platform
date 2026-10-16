@@ -11,6 +11,9 @@ Plateforme de boutiques en ligne pour la Polynésie française. Un seul Worker C
 
 | Module | Détail |
 |---|---|
+| Essais gratuits | 3 générations par visiteur sans compte (`TRIAL_GENERATIONS`), compteur par empreinte HMAC de l'IP, remis à zéro après 30 jours |
+| Import d'image | Capture d'écran de page Facebook/Instagram ou photo de produits : le modèle vision (`@cf/meta/llama-3.2-11b-vision-instruct`) en tire nom, activité, produits et couleurs ; l'image n'est jamais enregistrée |
+| Séparation | Application privée sur `APP_HOST` (générateur, connexion, tableau de bord, admin) ; vitrines sur `<boutique>.ROOT_DOMAIN`, limitées à `/`, `/commander`, `/commande/<id>`, `/img/` ; la vitrine ne lit que la copie publiée (`publications`), republiée à chaque modification |
 | Générateur IA | Le visiteur décrit son activité en une phrase : Workers AI (Llama 3.3 70B, sortie JSON) propose nom, modèle, couleurs, textes, sections et 4 à 6 produits ; aperçu en direct dans un téléphone ; la boutique créée reprend tout. Si l'IA est indisponible ou lente (15 s), une proposition automatique par mots-clés prend le relais, annoncée comme telle |
 | Accueil | Look « IA / tech » : générateur en tête, carrousel des 4 modèles, étapes, formules |
 | Panier | Bouton « Ajouter au panier », compteur, panneau latéral (quantités, total, coordonnées et validation), mémorisé sur le téléphone ; sans JavaScript, la commande classique reste disponible |
@@ -41,12 +44,14 @@ URI de redirection autorisée : `https://<domaine-de-l-app>/auth/google/callback
 1. `npm install` puis `npx wrangler login`
 2. `npx wrangler d1 create hinova_boutiques` → copier l'`database_id` dans `wrangler.toml`
 3. `npx wrangler r2 bucket create hinova-boutiques-images`
-4. `npm run db:remote` (applique `migrations/0001` à `0004`)
+4. `npm run db:remote` (applique `migrations/0001` à `0006`)
 5. Secret obligatoire pour encaisser : `STRIPE_SECRET_KEY` (clé secrète ou clé restreinte Stripe). Obligatoire aussi : `STRIPE_WEBHOOK_SECRET`. Facultatifs : `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
 6. `wrangler.toml` : `ADMIN_EMAILS` et les 6 prix `STRIPE_PRICE_*` (déjà renseignés). Webhook Stripe : `https://<app>/api/stripe/webhook` (événements checkout.session.completed, invoice.paid, invoice.payment_failed, customer.subscription.updated, customer.subscription.deleted)
 7. `npm run deploy`
 
 **C. Domaine**
+- `APP_HOST = "app.hinovadigitalcorp.com"` : route `app.hinovadigitalcorp.com/*` → Worker. Toute autre adresse non-vitrine est redirigée vers l'application.
+- Modèle vision : accepter une fois la licence Meta (`curl …/ai/run/@cf/meta/llama-3.2-11b-vision-instruct -d '{"prompt":"agree"}'`, voir la doc Workers AI). Sans cela, l'import d'image demande une phrase de description.
 8. Route `boutiques.hinovadigitalcorp.com/*` → Worker
 9. Sous-domaines boutiques : DNS `*.boutiques` + route `*.boutiques.hinovadigitalcorp.com/*`, puis `ROOT_DOMAIN = "boutiques.hinovadigitalcorp.com"`. Sans cela, les boutiques sont à `/b/<adresse>`.
 
@@ -72,7 +77,10 @@ ADMIN_EMAILS="admin@test.pf"
 STRIPE_WEBHOOK_SECRET="whsec_test_local_123"
 EOF
 npm run dev                            # http://localhost:8787 (environnement « test », sans Workers AI : la proposition automatique est utilisée)
-BASE=http://localhost:8787 npm test    # 88 vérifications de bout en bout
+BASE=http://localhost:8787 npm test    # 102 vérifications de bout en bout
+# Séparation application / vitrines (second serveur) :
+# npx wrangler dev --env test --port 8790 --inspector-port 9231 --var ROOT_DOMAIN:boutiques.test --var APP_HOST:app.test
+# BASE=http://localhost:8790 bash test/separation.sh   # 16 vérifications
 ```
 
 ## Structure
@@ -82,6 +90,8 @@ migrations/0001_initial_schema.sql         Schéma initial (boutiques, utilisate
 migrations/0002_sections_contacts_paiements.sql  Ajouts : sections, contacts, moyens de paiement, infos de livraison
 migrations/0003_comptes_et_abonnements_stripe.sql Comptes e-mail, inscriptions en attente de paiement, liens Stripe, configuration
 migrations/0004_securite_paiements_osb.sql   Journal des paiements (idempotence), journal d'audit, impayés, justificatifs OSB
+migrations/0005_publications.sql            Copie publiée de chaque vitrine (frontière privé / public)
+migrations/0006_essais_generation.sql       Essais gratuits du générateur
 src/index.js     Routage, connexion Google, tableau de bord, vitrines, factures, admin, tâche planifiée
 src/landing.js   Accueil : générateur IA et carrousel
 src/ai.js        Génération par Workers AI et proposition automatique de secours

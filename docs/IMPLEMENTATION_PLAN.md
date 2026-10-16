@@ -20,6 +20,13 @@ Chaque phase : tests exécutés, build vérifié, résumé des fichiers, secrets
 - **PRO** (paiement intégré au site) : prochaine étape — page de paiement OSB appelée depuis le panier et confirmation automatique de la commande par notification signée. Documentation : https://secure.osb.pf/doc/fr-FR/ (à étudier avant de coder).
 - **EXPERT** (API REST, abonnements) : non nécessaire pour les boutiques ; utile plus tard si Hinova encaisse ses propres abonnements via OSB.
 
+## Phase 2 (16/10/2026) — Séparation et parcours d'essai : FAITE (102/102 + 16/16)
+- Application privée (`APP_HOST`) et vitrines (`<boutique>.ROOT_DOMAIN`) strictement séparées ; aucune route privée sur une vitrine, même avec un cookie.
+- Vitrine en lecture seule sur `publications` (copie publique), republiée à chaque modification du tableau de bord.
+- 3 essais gratuits sans compte ; import d'image (capture de réseau social ou photo) lue par le modèle vision, jamais stockée.
+- Monogramme automatique quand la boutique n'a pas de logo ; panier toujours visible en haut à droite.
+- Acheteurs sans compte ; fiches clients = offre sur devis via le commercial Hinova (à ajouter sur la page des formules).
+
 ## Phase 1 bis — Données en UE (avant mise en production)
 - Nouvelle base D1 et nouveau bucket R2 en juridiction `eu`, transfert, bascule (voir CONFORMITE.md §2).
 

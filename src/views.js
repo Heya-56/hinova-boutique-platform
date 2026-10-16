@@ -131,6 +131,7 @@ header.shop{background:var(--surface);border-bottom:1px solid var(--line);positi
 header.shop .wrap{display:flex;align-items:center;justify-content:space-between;min-height:62px;gap:12px}
 .logo{display:flex;align-items:center;gap:10px;text-decoration:none;font-family:var(--head);font-weight:var(--hw);text-transform:var(--hc);letter-spacing:var(--hs);font-size:1.2rem}
 .logo img{height:40px;width:auto}
+.mono{width:40px;height:40px;border-radius:50%;display:inline-grid;place-items:center;background:var(--p);color:var(--on-p);font:700 .95rem/1 Inter,system-ui,sans-serif;letter-spacing:.02em;flex:none;box-shadow:0 0 0 3px var(--s)}
 .head-cta{font-size:.9rem;font-weight:600;text-decoration:none;border:1px solid var(--line);border-radius:var(--br);padding:8px 14px}
 .s{padding:clamp(40px,8vw,80px) 0}
 ${c.m.tokens.hero === 'surface' ? `.s-hero{background:var(--surface) ${heroPattern(c.primary)};color:var(--ink);border-bottom:1px solid var(--line)}.s-hero h1{color:var(--p)}` : `.s-hero{background:var(--p) ${heroPattern(c.onPrimary)};color:var(--on-p)}`}
@@ -177,7 +178,7 @@ const CART_CSS = `
 .add{display:none;margin-top:8px;width:100%;background:var(--p);color:var(--on-p);border:0;border-radius:var(--br);padding:10px 12px;font:600 .9rem/1.1 Inter,system-ui,sans-serif;cursor:pointer}
 .add:active{transform:scale(.97)}
 .js .qty{display:none}.js .add{display:block}.js .no-js-only{display:none}
-.cart-btn{display:none;align-items:center;gap:8px;font:600 .9rem/1 Inter,system-ui,sans-serif;background:var(--p);color:var(--on-p);border:0;border-radius:var(--br);padding:9px 14px;cursor:pointer}
+.cart-btn{box-shadow:0 6px 18px rgba(0,0,0,.18);display:none;align-items:center;gap:8px;font:600 .9rem/1 Inter,system-ui,sans-serif;background:var(--p);color:var(--on-p);border:0;border-radius:var(--br);padding:9px 14px;cursor:pointer}
 .js .cart-btn{display:inline-flex}
 .cart-btn b{background:var(--on-p);color:var(--p);border-radius:99px;min-width:22px;height:22px;display:inline-grid;place-items:center;font-size:.78rem;padding:0 6px}
 .cart-btn.bump{animation:bump .35s}@keyframes bump{50%{transform:scale(1.12)}}
@@ -239,7 +240,9 @@ const CART_JS = `(function(){
 
 export function storePage(b, { title, body, base = '', annonce = '', description = '', cart = false, clearCart = false }) {
   const c = storeColors(b);
-  const logo = b.logo_url ? `<img src="${esc(b.logo_url)}" alt="">` : '';
+  // Logo : celui du commerçant, sinon un monogramme généré aux couleurs de la boutique.
+  const initials = String(b.nom || '').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase() || 'B';
+  const logo = b.logo_url ? `<img src="${esc(b.logo_url)}" alt="">` : `<span class="mono" aria-hidden="true">${esc(initials)}</span>`;
   const ctaHref = b.whatsapp ? `https://wa.me/${esc(b.whatsapp)}` : `${esc(base)}/#produits`;
   const cartKey = base || 'site';
   const drawer = cart ? `<div class="drawer" id="panier" role="dialog" aria-modal="true" aria-labelledby="panier-t" hidden>

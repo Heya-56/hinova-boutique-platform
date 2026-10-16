@@ -16,7 +16,7 @@ import { DEMOS, demoBoutique } from './demo.js';
 import { illu } from './art.js';
 import { EDITOR_JS, EDITOR_CSS } from './editor.js';
 import { landingPage } from './landing.js';
-import { generateShop, fallbackGen, encodeGen, decodeGen } from './ai.js';
+import { generateShop, fallbackGen, encodeGen, decodeGen, readImage } from './ai.js';
 import { productPhoto } from './photos.js';
 import {
   stripeReady, priceFor, createCheckout, getCheckout, getSubscription, createPortal, periodEnd, invoicePeriodEnd, invoiceSubscription, invoiceMetadata, verifyWebhook, addSubscriptionItem,
@@ -553,19 +553,82 @@ async function handleStripeEvent(env, evt, o) {
 
 // ───────────────────────────── Générateur IA ─────────────────────────────
 
+// Essais gratuits sans compte : compteur par empreinte HMAC de l'IP (jamais l'IP en clair), remis à zéro après 30 jours.
+async function trialCount(env, request, increment) {
+  const ip = request.headers.get('cf-connecting-ip') || 'local';
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(await sessionSecret(env)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('essais:' + ip)));
+  const cle = [...mac.slice(0, 16)].map((x) => x.toString(16).padStart(2, '0')).join('');
+  await env.DB.prepare(`DELETE FROM essais_generation WHERE cle = ? AND depuis < datetime('now', '-30 days')`).bind(cle).run();
+  if (increment) {
+    const r = await env.DB.prepare(`INSERT INTO essais_generation (cle, nombre) VALUES (?, 1)
+      ON CONFLICT(cle) DO UPDATE SET nombre = nombre + 1 RETURNING nombre`).bind(cle).first();
+    return r.nombre;
+  }
+  const r = await env.DB.prepare('SELECT nombre FROM essais_generation WHERE cle = ?').bind(cle).first();
+  return r ? r.nombre : 0;
+}
+
+const IMAGE_GEN_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+const MAX_GEN_IMAGE = 4 * 1024 * 1024;
+
+// Générateur : « rapide » ouvre un essai (proposition instantanée, compte 1 essai) ;
+// « ia » affine l'essai en cours ; « image » lit une capture ou une photo puis génère (compte 1 essai).
 async function apiGenerate(request, env) {
-  let body = {};
-  try { body = await request.json(); } catch { /* corps invalide */ }
-  const description = clean(body.description, 400);
-  const nom = clean(body.nom, 60);
-  if (description.length < 8) return Response.json({ error: 'Décrivez votre activité en une phrase (8 caractères minimum).' }, { status: 400 });
-  // « rapide » : proposition instantanée ; sinon : rédaction par l'IA (avec secours automatique).
-  const gen = body.mode === 'rapide' ? fallbackGen(description, nom) : await generateShop(env, description, nom);
+  const limit = int(env.TRIAL_GENERATIONS, 3);
+  const isForm = (request.headers.get('content-type') || '').startsWith('multipart/form-data');
+  let body = {}, file = null;
+  if (isForm) {
+    const f = await readForm(request);
+    body = { description: f.get('description'), nom: f.get('nom'), mode: 'image' };
+    file = f.get('image');
+  } else {
+    try { body = await request.json(); } catch { /* corps invalide */ }
+  }
+  let description = clean(body.description, 400);
+  let nom = clean(body.nom, 60);
+  const mode = ['rapide', 'ia', 'image'].includes(body.mode) ? body.mode : 'ia';
+  const tooMany = () => Response.json({ error: `Vous avez utilisé vos ${limit} essais gratuits. Créez votre boutique pour continuer à la modifier autant que vous voulez.`, limite: true, creer: '/demarrer' }, { status: 429 });
+
+  let couleurs = [];
+  if (mode === 'image') {
+    const hasFile = file && typeof file !== 'string' && file.size > 0;
+    if (!hasFile && description.length < 8) return Response.json({ error: 'Ajoutez une image ou décrivez votre activité.' }, { status: 400 });
+    let bytes = null;
+    if (hasFile) {
+      if (!IMAGE_GEN_TYPES[file.type]) return Response.json({ error: 'Image non acceptée : JPG, PNG ou WebP.' }, { status: 400 });
+      if (file.size > MAX_GEN_IMAGE) return Response.json({ error: 'Image trop lourde (4 Mo maximum).' }, { status: 400 });
+      bytes = new Uint8Array(await file.arrayBuffer());
+      const ok = file.type === 'image/png' ? bytes[0] === 0x89 && bytes[1] === 0x50 : file.type === 'image/jpeg' ? bytes[0] === 0xff && bytes[1] === 0xd8 : bytes[8] === 0x57 && bytes[9] === 0x45;
+      if (!ok) return Response.json({ error: 'Le fichier ne correspond pas à une image.' }, { status: 400 });
+    }
+    if (await trialCount(env, request, false) >= limit) return tooMany();
+    if (bytes) {
+      let lu = null;
+      try { lu = await readImage(env, bytes, file.type); } catch (e) { console.error('Lecture d’image en échec', e && e.message); }
+      if (lu) {
+        nom = nom || lu.nom;
+        description = [description, lu.activite, lu.produits.length ? `Produits : ${lu.produits.join(', ')}` : ''].filter(Boolean).join('. ').slice(0, 400);
+        couleurs = lu.couleurs;
+      } else if (description.length < 8) {
+        return Response.json({ error: 'Nous n’avons pas pu lire cette image. Décrivez votre activité en une phrase, ou essayez une autre capture.' }, { status: 422 });
+      }
+    }
+    await trialCount(env, request, true);
+  } else {
+    if (description.length < 8) return Response.json({ error: 'Décrivez votre activité en une phrase (8 caractères minimum).' }, { status: 400 });
+    if (mode === 'rapide') { if (await trialCount(env, request, true) > limit) return tooMany(); }
+    else if (await trialCount(env, request, false) > limit) return tooMany();
+  }
+
+  const gen = mode === 'rapide' ? fallbackGen(description, nom) : await generateShop(env, description, nom);
+  if (couleurs.length === 2) { gen.couleur_principale = couleurs[0]; gen.couleur_secondaire = couleurs[1]; }
+  const used = await trialCount(env, request, false);
   const g = encodeGen(gen);
   return Response.json({
     source: gen.source, nom: gen.nom, slogan: gen.slogan, modele: gen.modele, modeleLabel: getModele(gen.modele).label,
     produits: gen.offres.length, sections: gen.sections.filter((x) => x.visible).length,
-    couleurs: [gen.couleur_principale, gen.couleur_secondaire],
+    couleurs: [gen.couleur_principale, gen.couleur_secondaire], essais_restants: Math.max(0, limit - used),
     apercu: `/apercu?g=${g}`, creer: `/demarrer?g=${g}`,
   }, { headers: { 'cache-control': 'no-store' } });
 }

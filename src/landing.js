@@ -30,6 +30,10 @@ a{color:inherit}h1,h2,h3{font-family:var(--head);font-weight:600;line-height:1.0
 .gen textarea{min-height:92px;resize:vertical;font-size:1.02rem}
 .gen textarea:focus,.gen input:focus{border-color:rgba(63,224,197,.6);box-shadow:0 0 0 3px rgba(63,224,197,.15)}
 .gen input{margin-top:10px}
+.drop{display:block;margin-top:10px;border:1px dashed rgba(63,224,197,.45);border-radius:12px;padding:12px 14px;cursor:pointer;text-transform:none!important;letter-spacing:0!important;font:400 .86rem/1.45 Inter,sans-serif!important;color:var(--muted)!important}
+.drop b{display:block;color:var(--ink);margin-bottom:3px}.drop input{position:absolute;width:1px;height:1px;opacity:0}
+.drop:focus-within{border-color:rgba(63,224,197,.9)}.drop.has{border-style:solid;background:rgba(63,224,197,.06)}
+.trials{font:.78rem/1.4 var(--mono);color:var(--muted);margin:6px 2px 0}.trials a{color:var(--cyan)}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
 .chip{font:.8rem/1 Inter,sans-serif;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 11px;cursor:pointer}
 .chip:hover{color:var(--ink);border-color:rgba(63,224,197,.4)}
@@ -117,8 +121,15 @@ const JS = `(function(){
   function line(txt,cls){ var p=d.createElement('div'); if(cls) p.className=cls; p.textContent=txt; term.appendChild(p); return p; }
   function wait(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
   var running=false, run=0;
-  function post(mode,v){ return fetch('/api/generer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({description:v,nom:nom.value.trim(),mode:mode})})
-    .then(function(r){ return r.json().then(function(j){ if(!r.ok) throw new Error(j.error||'Erreur'); return j; }); }); }
+  var img=d.getElementById('img'), imgName=d.getElementById('img-name'), trials=d.getElementById('trials');
+  img.addEventListener('change',function(){ var f=img.files[0]; img.parentNode.classList.toggle('has',!!f); if(f) imgName.textContent='Image choisie : '+f.name; });
+  function left(j){ if(j&&typeof j.essais_restants==='number') trials.textContent=j.essais_restants>0?('Essais gratuits restants : '+j.essais_restants):'Dernier essai gratuit utilisé. Créez votre boutique pour continuer.'; }
+  function fail(j){ var e=new Error(j.error||'Erreur'); e.limite=!!j.limite; return e; }
+  function post(mode,v){
+    var opts;
+    if(mode==='image'){ var fd=new FormData(); fd.append('image',img.files[0]); fd.append('description',v); fd.append('nom',nom.value.trim()); opts={method:'POST',body:fd}; }
+    else opts={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({description:v,nom:nom.value.trim(),mode:mode})};
+    return fetch('/api/generer',opts).then(function(r){ return r.json().then(function(j){ if(!r.ok) throw fail(j); left(j); return j; }); }); }
   function show(j,label){
     frame.style.opacity=0;
     frame.onload=function(){ fit(); frame.style.opacity=1; scan.classList.remove('on'); };
@@ -132,15 +143,18 @@ const JS = `(function(){
   }
   function done(){ running=false; go.disabled=false; go.classList.remove('busy'); go.querySelector('span').textContent='Régénérer ✦'; }
   form.addEventListener('submit',function(e){ e.preventDefault(); if(running) return;
-    var v=desc.value.trim(); err.textContent='';
-    if(v.length<8){ err.textContent='Décrivez votre activité en une phrase.'; desc.focus(); return; }
+    var v=desc.value.trim(), withImg=img.files&&img.files[0]; err.textContent='';
+    if(!withImg&&v.length<8){ err.textContent='Décrivez votre activité en une phrase, ou importez une image.'; desc.focus(); return; }
     var me=++run; running=true; go.disabled=true; go.classList.add('busy'); go.querySelector('span').textContent='Génération…';
     res.classList.remove('on'); term.textContent=''; term.classList.add('on'); scan.classList.add('on'); tag.textContent='génération…';
     var refine=d.getElementById('r-ai'); refine.hidden=true;
-    var ia=post('ia',v);
     (async function(){
       try{
-        line('> analyse de votre activité…'); var j=await post('rapide',v); await wait(250);
+        if(withImg){
+          line('> lecture de votre image…','cur'); var m=await post('image',v); term.lastChild.className='';
+          line('✓ nom, activité et couleurs repérés','ok'); show(m,'✦ Créée depuis votre image'); done(); return;
+        }
+        line('> analyse de votre activité…'); var j=await post('rapide',v); var ia=post('ia',v); await wait(250);
         line('✓ modèle '+j.modeleLabel+', couleurs et sections','ok'); await wait(200);
         line('✓ première version prête','ok');
         show(j,'✦ Première version'); refine.hidden=false;
@@ -152,7 +166,9 @@ const JS = `(function(){
           else { line('· version automatique conservée'); d.getElementById('r-src').textContent='✦ Proposition automatique'; }
         }catch(x){ if(me===run){ cur.className=''; line('· version automatique conservée'); } }
         if(me===run) refine.hidden=true;
-      }catch(x){ err.textContent=x.message||'La génération a échoué, réessayez.'; scan.classList.remove('on'); tag.textContent='exemple'; done(); }
+      }catch(x){ err.textContent=x.message||'La génération a échoué, réessayez.';
+        if(x.limite){ trials.innerHTML='Essais gratuits terminés · <a href="/demarrer">Créer ma boutique</a>'; }
+        scan.classList.remove('on'); tag.textContent='exemple'; done(); }
     })();
   });
   d.getElementById('r-again').addEventListener('click',function(){ form.requestSubmit ? form.requestSubmit() : go.click(); });
@@ -209,9 +225,12 @@ export function landingPage(env) {
         <label for="desc">Votre activité</label>
         <textarea id="desc" maxlength="400" placeholder="Ex. : je fais des bijoux en nacre et en coquillages à Moorea, je veux vendre dans toutes les îles"></textarea>
         <input id="nom" maxlength="60" placeholder="Nom de la boutique (facultatif)" aria-label="Nom de la boutique (facultatif)">
+        <label class="drop" for="img"><input id="img" type="file" accept="image/jpeg,image/png,image/webp">
+          <b>Ou importez une image</b><span id="img-name">Astuce : faites une capture d’écran de votre page Facebook, Instagram ou de votre réseau préféré, ou une photo de vos produits. L’IA en tire le nom, l’activité et vos couleurs. L’image n’est pas conservée.</span></label>
         <div class="chips" aria-label="Exemples">${EXAMPLES.map((x) => `<button type="button" class="chip">${esc(x)}</button>`).join('')}</div>
         <button class="go" id="go" type="submit"><i class="spin"></i><span>Générer ma boutique ✦</span></button>
         <p class="err" id="err" role="alert"></p>
+        <p class="trials" id="trials">3 essais gratuits, sans créer de compte.</p>
         <div class="term" id="term" aria-live="polite"></div>
         <div class="result" id="result" aria-live="polite">
           <span class="src" id="r-src"></span><h3 id="r-nom"></h3><p id="r-slogan"></p>

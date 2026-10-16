@@ -142,7 +142,7 @@ echo "9. Générateur IA et panier"
 check "accueil : formulaire du générateur" 'curl -s $BASE/ | grep -q "id=\"gen\""'
 check "description trop courte refusée" '[ "$(code "${H[@]}" -H "content-type: application/json" -X POST -d "{\"description\":\"abc\"}" $BASE/api/generer)" = 400 ]'
 check "générateur appelé d’une autre origine refusé" '[ "$(code -H "Origin: https://pirate.example" -H "content-type: application/json" -X POST -d "{}" $BASE/api/generer)" = 403 ]'
-GEN=$(curl -s "${H[@]}" -H "content-type: application/json" -X POST -d '{"description":"Je fais du monoï et des savons à Moorea","nom":"Vai Soins"}' "$BASE/api/generer")
+GEN=$(curl -s "${H[@]}" -H "CF-Connecting-IP: 10.1.$R" -H "content-type: application/json" -X POST -d '{"description":"Je fais du monoï et des savons à Moorea","nom":"Vai Soins"}' "$BASE/api/generer")
 check "génération : modèle Tiare deviné, nom gardé" 'echo "$GEN" | grep -q "\"modele\":\"tiare\"" && echo "$GEN" | grep -q "Vai Soins"'
 APERCU=$(echo "$GEN" | grep -o '"apercu":"[^"]*"' | cut -d'"' -f4); CREER=$(echo "$GEN" | grep -o '"creer":"[^"]*"' | cut -d'"' -f4)
 check "aperçu en direct affichable dans l’accueil" 'curl -s -D - "$BASE$APERCU" | grep -qi "x-frame-options: SAMEORIGIN"'
@@ -155,6 +155,22 @@ check "boutique créée avec les 4 produits générés" 'curl -s -b "$JG" $BASE/
 check "vitrine générée avec ses textes" 'curl -s $BASE/b/vai-$R | grep -q "parfum du fenua"'
 check "panier en overlay présent dans une boutique qui vend" 'S=$(curl -s $BASE/b/$SLUG); echo "$S" | grep -q "id=\"cart-open\"" && echo "$S" | grep -q "data-add="'
 check "pas de panier tant qu’aucun paiement n’est configuré" '! curl -s $BASE/b/vai-$R | grep -q "id=\"cart-open\""'
+
+echo "9 bis. Essais gratuits et import d'image"
+IP=(-H "CF-Connecting-IP: 10.2.$R")
+gen(){ curl -s -o /dev/null -w '%{http_code}' "${H[@]}" "${IP[@]}" -H "content-type: application/json" -X POST -d "{\"description\":\"Bijoux en nacre faits main à Moorea\",\"mode\":\"$1\"}" "$BASE/api/generer"; }
+check "essai 1 accordé, affiné par l’IA" '[ "$(gen rapide)" = 200 ] && [ "$(gen ia)" = 200 ]'
+check "essais restants annoncés" 'curl -s "${H[@]}" "${IP[@]}" -H "content-type: application/json" -X POST -d "{\"description\":\"Bijoux en nacre faits main à Moorea\",\"mode\":\"rapide\"}" $BASE/api/generer | grep -q "\"essais_restants\":1"'
+gen rapide >/dev/null
+check "4e essai refusé avec lien vers l’inscription" '[ "$(gen rapide)" = 429 ] && [ "$(gen ia)" = 429 ]'
+check "un autre visiteur garde ses 3 essais" '[ "$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" -H "CF-Connecting-IP: 10.3.$R" -H "content-type: application/json" -X POST -d "{\"description\":\"Bijoux en nacre faits main à Moorea\",\"mode\":\"rapide\"}" $BASE/api/generer)" = 200 ]'
+printf '\x89PNG\r\n\x1a\n0000' > "$TMP/cap.png"; printf 'pas une image' > "$TMP/faux.png"
+IMG=(-H "CF-Connecting-IP: 10.4.$R")
+check "image : faux fichier refusé" '[ "$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/faux.png;type=image/png" $BASE/api/generer)" = 400 ]'
+check "image illisible sans description → demande une phrase" '[ "$(curl -s -o /dev/null -w "%{http_code}" "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/cap.png;type=image/png" $BASE/api/generer)" = 422 ]'
+check "image + description → boutique proposée" 'curl -s "${H[@]}" "${IMG[@]}" -X POST -F "image=@$TMP/cap.png;type=image/png" -F "description=Savons et monoï au tiare à Tahiti" $BASE/api/generer | grep -q "\"apercu\""'
+check "accueil : import d’image et conseil capture réseau social" 'L=$(curl -s $BASE/); echo "$L" | grep -q "type=\"file\"" && echo "$L" | grep -qi "capture d’écran"'
+check "vitrine : monogramme quand il n’y a pas de logo" 'curl -s $BASE/b/vai-$R | grep -q "class=\"mono\""'
 
 echo "10. Abonnements Stripe (webhook signé)"
 WHS="${WHS:-whsec_test_local_123}"
