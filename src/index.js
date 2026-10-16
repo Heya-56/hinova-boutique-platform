@@ -60,12 +60,19 @@ async function route(request, env) {
   const method = request.method;
   if (method === 'POST' && !sameOrigin(request)) return new Response('Origine refusée', { status: 403 });
 
-  // Boutique servie sur son propre sous-domaine : <boutique>.<ROOT_DOMAIN>
+  // Deux espaces strictement séparés :
+  //  - vitrines publiques : <boutique>.<ROOT_DOMAIN> — lecture du catalogue publié et commande, rien d'autre ;
+  //  - application privée : APP_HOST — générateur, connexion, tableau de bord, administration, webhooks.
+  // Une vitrine ne lit jamais de session et n'expose aucune route privée ; le cookie de session (sans attribut Domain)
+  // n'est envoyé qu'à APP_HOST.
   const root = (env.ROOT_DOMAIN || '').toLowerCase();
+  const appHost = (env.APP_HOST || '').toLowerCase();
   const host = url.hostname.toLowerCase();
-  if (root && host.endsWith('.' + root) && host !== 'www.' + root) {
-    if (url.pathname.startsWith('/img/')) return serveImage(url, env);
-    return storefront(request, env, url, host, url.pathname, '');
+  if (root && host.endsWith('.' + root) && host !== 'www.' + root && host !== appHost) {
+    return storefrontHost(request, env, url, host);
+  }
+  if (appHost && host !== appHost) {
+    return new Response(null, { status: 301, headers: { location: `https://${appHost}${url.pathname}${url.search}` } });
   }
 
   const p = url.pathname.replace(/\/+$/, '') || '/';
@@ -80,6 +87,8 @@ async function route(request, env) {
   if (p === '/api/generer' && method === 'POST') return apiGenerate(request, env);
   if (p === '/apercu') return previewStore(url);
   if (parts[0] === 'b' && parts[1]) {
+    // Avec un domaine de vitrines configuré, les boutiques ne sont jamais servies depuis l'application.
+    if (root) return redirect(`https://${encodeURIComponent(parts[1].toLowerCase())}.${root}/`);
     const sub = '/' + parts.slice(2).join('/');
     return storefront(request, env, url, parts[1], sub, `/b/${encodeURIComponent(parts[1])}`);
   }
@@ -415,6 +424,7 @@ async function finalizeInscription(env, inscId, info) {
     ...offres.map((o, i) => env.DB.prepare('INSERT INTO offres (id, boutique_id, nom, description, prix_xpf, stock, ordre) VALUES (?, ?, ?, ?, ?, 1, ?)')
       .bind(uid(), bid, o.nom, o.description, o.prix_xpf, i + 1)),
   ]);
+  await publish(env, bid);
   return bid;
 }
 
@@ -633,7 +643,16 @@ function dash(title, active, body, extraHead = '') {
   return html(appPage({ title, body, nav: dashNav(active), brandHref: '/tableau-de-bord', extraHead }), 200, { 'cache-control': 'no-store' });
 }
 
+// Toute modification du contenu public est republiée aussitôt (comme une base Airtable reliée à son site) :
+// le tableau de bord écrit dans les tables privées, la vitrine ne lit que la copie publiée.
+const PUBLISHING_SECTIONS = new Set(['produits', 'parametres', 'apparence']);
 async function dashboard(request, env, url, b, who, sub) {
+  const res = await dashboardRoute(request, env, url, b, who, sub);
+  if (request.method === 'POST' && PUBLISHING_SECTIONS.has(sub[0])) await publish(env, b.id);
+  return res;
+}
+
+async function dashboardRoute(request, env, url, b, who, sub) {
   const post = request.method === 'POST';
   const [section, id, action] = sub;
   if (!section) return dashHome(env, url, b);
@@ -1110,24 +1129,62 @@ function demoStore(modele) {
   });
 }
 
+// ───────────── Publication (frontière entre le privé et le public) ─────────────
+
+// Seuls ces champs de la boutique sont copiés vers la vitrine.
+const PUBLIC_FIELDS = ['id', 'domaine', 'nom', 'slogan', 'modele', 'logo_url', 'couleur_principale', 'couleur_secondaire', 'sections_json',
+  'telephone', 'whatsapp', 'ile', 'infos_livraison', 'rib', 'consignes_ccp', 'lien_paiement_carte', 'numero_tahiti'];
+
+async function publish(env, boutiqueId) {
+  const b = await env.DB.prepare('SELECT * FROM boutiques WHERE id = ?').bind(boutiqueId).first();
+  if (!b) return;
+  const { results } = await env.DB.prepare('SELECT id, nom, description, prix_xpf, image_url, ordre FROM offres WHERE boutique_id = ? ORDER BY ordre, rowid').bind(boutiqueId).all();
+  const contenu = JSON.stringify({ boutique: Object.fromEntries(PUBLIC_FIELDS.map((k) => [k, b[k] ?? null])), offres: results });
+  await env.DB.prepare(`INSERT INTO publications (boutique_id, contenu_json) VALUES (?, ?)
+    ON CONFLICT(boutique_id) DO UPDATE SET contenu_json = excluded.contenu_json, version = version + 1, publie_le = CURRENT_TIMESTAMP`).bind(boutiqueId, contenu).run();
+}
+
+// Lecture côté vitrine : statut d'ouverture + copie publiée + stock en direct. Rien d'autre.
+async function loadPublished(env, domaine) {
+  const s = await env.DB.prepare('SELECT id, statut, date_echeance FROM boutiques WHERE domaine = ?').bind(domaine.toLowerCase()).first();
+  if (!s) return null;
+  const read = () => env.DB.prepare('SELECT contenu_json FROM publications WHERE boutique_id = ?').bind(s.id).first();
+  let pub = await read();
+  if (!pub) { await publish(env, s.id); pub = await read(); }
+  const c = JSON.parse(pub.contenu_json);
+  const { results } = await env.DB.prepare('SELECT id, stock FROM offres WHERE boutique_id = ?').bind(s.id).all();
+  const stock = Object.fromEntries(results.map((x) => [x.id, x.stock]));
+  const offres = c.offres.filter((o) => o.id in stock).map((o) => ({ ...o, stock: stock[o.id] }));
+  return { b: { ...c.boutique, statut: s.statut, date_echeance: s.date_echeance }, offres };
+}
+
+// Hôte d'une vitrine : seules les routes publiques existent.
+function storefrontHost(request, env, url, host) {
+  const p = url.pathname;
+  if (p.startsWith('/img/')) return serveImage(url, env);
+  if (p === '/robots.txt') return new Response('User-agent: *\nDisallow: /commande/\n', { headers: { 'content-type': 'text/plain' } });
+  if (p === '/' || p === '/commander' || /^\/commande\/[a-f0-9]{32}$/.test(p)) return storefront(request, env, url, host, p, '');
+  return notFound();
+}
+
 async function storefront(request, env, url, domaine, sub, base) {
-  const b = await env.DB.prepare('SELECT * FROM boutiques WHERE domaine = ?').bind(domaine.toLowerCase()).first();
-  if (!b) return notFound();
+  const pub = await loadPublished(env, domaine);
+  if (!pub) return notFound();
+  const { b, offres } = pub;
   if (isOffline(b, env)) {
     return html(storePage(b, { title: 'Boutique indisponible', base, body: '<section class="s"><div class="wrap narrow"><h1>Boutique momentanément indisponible</h1><p class="muted">Revenez bientôt.</p></div></section>' }), 503, { 'cache-control': 'no-store' });
   }
   if (sub === '/' && request.method === 'GET') {
-    const { results } = await env.DB.prepare('SELECT * FROM offres WHERE boutique_id = ? ORDER BY ordre, rowid').bind(b.id).all();
     const msg = url.searchParams.get('err') ? `<div class="flash err" role="alert">${esc(url.searchParams.get('err'))}</div>` : '';
-    return html(renderStore(b, results, parseSections(b.sections_json, b), { base, flashHtml: msg }));
+    return html(renderStore(b, offres, parseSections(b.sections_json, b), { base, flashHtml: msg }));
   }
-  if (sub === '/commander' && request.method === 'POST') return placeOrder(request, env, b, base);
+  if (sub === '/commander' && request.method === 'POST') return placeOrder(request, env, b, offres, base);
   const m = sub.match(/^\/commande\/([a-f0-9]{32})$/);
   if (m && request.method === 'GET') return orderConfirmation(env, b, m[1], base);
   return notFound();
 }
 
-async function placeOrder(request, env, b, base) {
+async function placeOrder(request, env, b, published, base) {
   const back = (msg) => redirect(withMsg(`${base}/`, 'err', msg) + '#produits');
   const f = await readForm(request);
   if (f.get('site_web')) return back('Commande refusée.');
@@ -1145,9 +1202,8 @@ async function placeOrder(request, env, b, base) {
   if (!wanted.length) return back('Choisissez au moins un produit.');
   if (wanted.length > 40) return back('Commande trop longue.');
 
-  const { results: offres } = await env.DB.prepare(`SELECT id, nom, prix_xpf, stock FROM offres WHERE boutique_id = ? AND id IN (${wanted.map(() => '?').join(',')})`)
-    .bind(b.id, ...wanted.map((w) => w.id)).all();
-  const byId = Object.fromEntries(offres.map((o) => [o.id, o]));
+  // Nom et prix : ceux que l'acheteur a vus (copie publiée) ; stock : en direct.
+  const byId = Object.fromEntries(published.map((o) => [o.id, o]));
   const lignes = [];
   for (const w of wanted) {
     const o = byId[w.id];

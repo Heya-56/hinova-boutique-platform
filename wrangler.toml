@@ -12,6 +12,8 @@ BRAND = "Hinova Boutiques"
 SUPPORT_EMAIL = "support@hinovadigitalcorp.com"
 # Domaine racine des boutiques : <boutique>.ROOT_DOMAIN. Vide = adresses /b/<boutique> uniquement.
 ROOT_DOMAIN = ""
+# Hôte de l'application privée (générateur, tableau de bord, admin). Vide = tout sur un seul hôte (développement).
+APP_HOST = ""
 TRIAL_DAYS = "14"
 GRACE_DAYS = "3"
 # Adresses Google qui deviennent administratrices à leur première connexion (séparées par des virgules)

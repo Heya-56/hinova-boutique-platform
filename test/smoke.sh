@@ -168,6 +168,7 @@ Y2=$(TZ=Pacific/Tahiti date -d @$END +%Y)
 check "renouvellement payé → échéance prolongée" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "/$Y2"'
 check "bouton « Gérer mon abonnement » absent tant que Stripe n’est pas branché" '! curl -s -b "$J" $BASE/tableau-de-bord | grep -q "Gérer mon abonnement"'
 hook "{\"id\":\"evt_del_$R\",\"type\":\"customer.subscription.deleted\",\"data\":{\"object\":{\"id\":\"$SUB\"}}}" >/dev/null
+check "vitrine : aucune donnée privée (e-mail du compte, identifiants Stripe)" 'S=$(curl -s $BASE/b/$SLUG); ! echo "$S" | grep -q "$EMAIL" && ! echo "$S" | grep -q "cus_$R" && ! echo "$S" | grep -q "$SUB"'
 check "résiliation → boutique hors ligne" '[ "$(code $BASE/b/$SLUG)" = 503 ]'
 PAY2="{\"id\":\"evt_pay2_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}"
 hook "{\"id\":\"evt_pay_$R\",\"type\":\"invoice.paid\",\"data\":{\"object\":{\"subscription\":\"$SUB\",\"lines\":{\"data\":[{\"period\":{\"end\":$END}}]}}}}" >/dev/null
