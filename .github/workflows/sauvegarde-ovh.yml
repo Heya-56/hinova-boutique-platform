@@ -1,0 +1,28 @@
+name: Sauvegarde quotidienne vers OVHcloud
+on:
+  schedule:
+    - cron: '30 15 * * *'   # 5 h 30, heure de Tahiti
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  sauvegarde:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: bash scripts/sauvegarde.sh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          OVH_S3_ENDPOINT: ${{ vars.OVH_S3_ENDPOINT }}
+          OVH_S3_REGION: ${{ vars.OVH_S3_REGION }}
+          OVH_BUCKET: ${{ vars.OVH_BUCKET }}
+          OVH_ACCESS_KEY_ID: ${{ secrets.OVH_ACCESS_KEY_ID }}
+          OVH_SECRET_ACCESS_KEY: ${{ secrets.OVH_SECRET_ACCESS_KEY }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
