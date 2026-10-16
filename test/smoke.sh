@@ -109,7 +109,7 @@ check "dossier OSB : consentement obligatoire" '[[ "$(osb Socredo "$TMP/id.pdf")
 check "dossier OSB : faux PDF refusé" '[[ "$(osb Socredo "$TMP/faux.pdf" "-F consentement=on")" == *err=* ]]'
 check "dossier OSB complet enregistré" '[[ "$(osb Socredo "$TMP/id.pdf" "-F consentement=on")" == *ok=* ]]'
 OSBP=$(curl -s -b "$J" $BASE/tableau-de-bord/osb)
-check "dossier OSB en attente, frais PayZen affichés" 'echo "$OSBP" | grep -q "En attente" && echo "$OSBP" | grep -q "2"$'"'"'\xc2\xa0'"'"'"200"'
+check "dossier OSB en attente, option PayZen mensuelle affichée" 'echo "$OSBP" | grep -q "En attente" && echo "$OSBP" | grep -q "par mois"'
 PIECE=$(echo "$OSBP" | grep -o '/tableau-de-bord/osb/piece/[a-f0-9]\{32\}' | head -1 | sed 's#.*/##')
 check "justificatif téléchargeable par son propriétaire" '[ "$(code -b "$J" $BASE/tableau-de-bord/osb/piece/$PIECE)" = 200 ]'
 check "justificatif invisible pour une autre boutique" '[ "$(code -b "$J2" $BASE/tableau-de-bord/osb/piece/$PIECE)" = 404 ]'
@@ -123,6 +123,9 @@ ADM=$(curl -s -b "$JA" "$BASE/admin")
 check "admin liste la boutique" 'echo "$ADM" | grep -q "$SLUG"'
 BID=$(echo "$ADM" | tr '\n' ' ' | grep -o "$SLUG.\{0,1500\}" | grep -o '/admin/b/[a-f0-9]\{32\}/paiement' | head -1 | cut -d/ -f4)
 check "dossier OSB visible côté admin" 'curl -s -b "$JA" $BASE/admin/osb | grep -q "Hina T"'
+DOS=$(curl -s -b "$JA" $BASE/admin/osb | grep -o '/admin/osb/[a-f0-9]\{32\}/statut' | head -1 | cut -d/ -f4)
+check "admin : justificatif téléchargeable" '[ "$(code -b "$JA" $BASE/admin/osb/piece/$PIECE)" = 200 ]'
+check "dossier validé sans Stripe → option PayZen signalée à facturer" '[[ "$(loc -b "$JA" "${H[@]}" -X POST $BASE/admin/osb/$DOS/statut -d statut=valide)" == *err=*facturer* ]]'
 curl -s -o /dev/null -b "$JA" "${H[@]}" -X POST "$BASE/admin/b/$BID/suspendre"
 check "boutique suspendue → vitrine 503" '[ "$(code $BASE/b/$SLUG)" = 503 ]'
 check "le commerçant voit l’alerte" 'curl -s -b "$J" $BASE/tableau-de-bord | grep -q "hors ligne"'

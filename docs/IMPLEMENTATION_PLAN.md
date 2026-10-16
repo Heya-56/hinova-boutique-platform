@@ -4,7 +4,7 @@ Chaque phase : tests exécutés, build vérifié, résumé des fichiers, secrets
 
 ## 0. Décisions validées (15/10/2026)
 1. Architecture : Worker mutualisé + D1 (pas de Supabase).
-2. Grille : Mini 1 500 / Standard 4 900 / Plus 9 900 XPF (9/16/32 produits) conservée ; option paiement en ligne PayZen avec dossier OSB justifié, 2 200 XPF de frais.
+2. Grille : Mini 1 500 / Standard 4 900 / Plus 9 900 XPF (9/16/32 produits) conservée ; option paiement en ligne PayZen avec dossier OSB justifié, **2 200 XPF par mois**, ajoutée à l'abonnement Stripe à la validation du dossier (prix Stripe `STRIPE_PRICE_OPTION_PAYZEN` à créer).
 3. Quotas de ventes 50/85/125 conservés.
 4. Domaine personnalisé : 2 000 XPF/an.
 5. Tout sur Cloudflare, avec données en juridiction UE (RGPD) ; portabilité vers un hébergement souverain polynésien plus tard.
@@ -14,6 +14,11 @@ Chaque phase : tests exécutés, build vérifié, résumé des fichiers, secrets
 - Webhook idempotent, `invoice.payment_failed` géré, audit des événements.
 - Inscription sans paiement et connexion de test bloquées hors `ENVIRONMENT = "test"`.
 - Dossier OSB : justificatifs privés, consentement daté, frais PayZen, plus aucun envoi externe.
+
+## PayZen : quelle formule OSB pour quel usage (d'après la présentation OSB)
+- **START** (TPE virtuel, lien ou e-mail de paiement) : ce que la plateforme gère déjà — le commerçant colle son lien de paiement, le statut de commande est mis à jour à la main.
+- **PRO** (paiement intégré au site) : prochaine étape — page de paiement OSB appelée depuis le panier et confirmation automatique de la commande par notification signée. Documentation : https://secure.osb.pf/doc/fr-FR/ (à étudier avant de coder).
+- **EXPERT** (API REST, abonnements) : non nécessaire pour les boutiques ; utile plus tard si Hinova encaisse ses propres abonnements via OSB.
 
 ## Phase 1 bis — Données en UE (avant mise en production)
 - Nouvelle base D1 et nouveau bucket R2 en juridiction `eu`, transfert, bascule (voir CONFORMITE.md §2).

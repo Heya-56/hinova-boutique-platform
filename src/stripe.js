@@ -76,3 +76,15 @@ export async function verifyWebhook(payload, header, secret, toleranceSec = 300)
   const expected = [...new Uint8Array(mac)].map((x) => x.toString(16).padStart(2, '0')).join('');
   return sigs.some((s) => s.length === expected.length && [...s].reduce((r, c, i) => r | (c.charCodeAt(0) ^ expected.charCodeAt(i)), 0) === 0);
 }
+
+// Ajout d'une option mensuelle (ligne supplémentaire) à un abonnement existant. Clé d'idempotence : un seul ajout par abonnement et prix.
+export async function addSubscriptionItem(env, subscription, price) {
+  const sub = await getSubscription(env, subscription);
+  if ((sub.items?.data || []).some((it) => it.price?.id === price)) return { deja: true };
+  const init = { method: 'POST', headers: { authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, 'content-type': 'application/x-www-form-urlencoded', 'idempotency-key': `item-${subscription}-${price}` } };
+  init.body = formEncode({ subscription, price, quantity: 1, proration_behavior: 'create_prorations' }).toString();
+  const res = await fetch(API + '/subscription_items', init);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Stripe ${res.status} : ${data?.error?.message || 'erreur'}`);
+  return data;
+}

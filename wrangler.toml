@@ -23,6 +23,8 @@ STRIPE_PRICE_PLAN_2_MENSUEL = "price_1UPStACVrYZbi1ZG8bFqdeE6"
 STRIPE_PRICE_PLAN_2_ANNUEL = "price_1UPStCCVrYZbi1ZGWMbzWui5"
 STRIPE_PRICE_PLAN_3_MENSUEL = "price_1UPStECVrYZbi1ZGhEXLuKU7"
 STRIPE_PRICE_PLAN_3_ANNUEL = "price_1UPStFCVrYZbi1ZG47vRMHqJ"
+# Option mensuelle PayZen (2 200 XPF/mois) : prix Stripe récurrent à créer, puis renseigner ici.
+STRIPE_PRICE_OPTION_PAYZEN = ""
 # Secrets (tableau de bord Cloudflare ou npx wrangler secret put …) : STRIPE_SECRET_KEY (obligatoire pour encaisser),
 # GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET (connexion Google, facultative), STRIPE_WEBHOOK_SECRET (obligatoire).
 # Le secret de session et le secret du webhook Stripe sont rangés dans la table config de la base.

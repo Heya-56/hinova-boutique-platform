@@ -58,9 +58,9 @@ export const ISLANDS = [
   'Tubuai', 'Rurutu', 'Raivavae', 'Rimatara', 'Autre île',
 ];
 
-// Option « paiement en ligne par carte » (PayZen via OSB) : frais Hinova de constitution du dossier.
-// Le contrat et l'abonnement OSB restent réglés directement par le commerçant à OSB.
-export const PAYZEN_OPTION = { label: 'Paiement en ligne par carte (PayZen / OSB)', fraisXpf: 2200 };
+// Option mensuelle « paiement en ligne par carte » (PayZen via OSB), facturée par Hinova en plus de la formule.
+// Ajoutée à l'abonnement Stripe quand le dossier OSB est validé. Le contrat OSB reste réglé directement à OSB.
+export const PAYZEN_OPTION = { label: 'Paiement en ligne par carte (PayZen / OSB)', fraisXpf: 2200, periode: 'mois' };
 
 // Nature des justificatifs joints au dossier OSB. Liste à aligner sur la liste officielle fournie par OSB.
 export const OSB_PIECES = {

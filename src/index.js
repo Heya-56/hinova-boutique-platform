@@ -19,7 +19,7 @@ import { landingPage } from './landing.js';
 import { generateShop, fallbackGen, encodeGen, decodeGen } from './ai.js';
 import { productPhoto } from './photos.js';
 import {
-  stripeReady, priceFor, createCheckout, getCheckout, getSubscription, createPortal, periodEnd, invoicePeriodEnd, invoiceSubscription, invoiceMetadata, verifyWebhook,
+  stripeReady, priceFor, createCheckout, getCheckout, getSubscription, createPortal, periodEnd, invoicePeriodEnd, invoiceSubscription, invoiceMetadata, verifyWebhook, addSubscriptionItem,
 } from './stripe.js';
 
 const SESSION = 'hb_s';
@@ -996,7 +996,7 @@ async function osbForm(env, url, b, who) {
     <input id="p_${k}" name="piece_${k}" type="file" accept="application/pdf,image/jpeg,image/png" ${k === 'autre' ? '' : 'required'}>`;
   const body = `${flash(url)}<div class="card"><h1>Paiement en ligne par carte (OSB / PayZen)</h1>
     <p>Pour accepter la carte bancaire, votre boutique a besoin d’un contrat de paiement en ligne OSB, ouvert à votre nom, adossé à un compte professionnel à la <b>Banque de Polynésie</b> ou à la <b>Socredo</b>. Remplissez ce dossier avec les justificatifs : nous le vérifions et le transmettons à OSB.</p>
-    <p><b>Frais de constitution du dossier : ${fmtXpf(PAYZEN_OPTION.fraisXpf)}</b>, facturés par Hinova Digital.</p>
+    <p><b>Option paiement en ligne : ${fmtXpf(PAYZEN_OPTION.fraisXpf)} par mois</b>, ajoutée à votre abonnement Hinova une fois le dossier validé par OSB. Vous pouvez l’arrêter à tout moment depuis « Gérer mon abonnement ».</p>
     <p class="small muted">Le contrat et l’abonnement OSB sont réglés directement par vous à OSB ; ils ne sont pas inclus dans votre formule Hinova. Les sommes payées par vos clients arrivent sur votre compte, jamais chez Hinova.</p></div>
   ${results.length ? `<div class="card"><h2>Mes demandes</h2><table><tbody>${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.raison_sociale)}<br>${piecesOf(d)}</td><td><span class="badge ${esc(d.statut)}">${esc(OSB_STATUTS[d.statut] || d.statut)}</span></td></tr>`).join('')}</tbody></table></div>` : ''}
   <div class="card"><h2>Nouvelle demande</h2><form method="post" enctype="multipart/form-data">
@@ -1012,7 +1012,7 @@ async function osbForm(env, url, b, who) {
     <label for="bq">Banque du compte professionnel</label><select id="bq" name="banque" required>${BANQUES_OSB.map((x) => `<option ${x === b.banque ? 'selected' : ''}>${x}</option>`).join('')}</select>
     <h3>Justificatifs</h3><p class="small muted">PDF, JPG ou PNG, 5 Mo maximum par fichier. Ils sont conservés en accès privé, visibles par vous et par l’équipe Hinova uniquement.</p>
     ${Object.keys(OSB_PIECES).map(pieceInput).join('')}
-    <label class="check"><input type="checkbox" name="consentement" required> J’autorise Hinova Digital à conserver ces informations et justificatifs pour préparer et transmettre mon dossier à OSB, et j’accepte les frais de ${fmtXpf(PAYZEN_OPTION.fraisXpf)}.</label>
+    <label class="check"><input type="checkbox" name="consentement" required> J’autorise Hinova Digital à conserver ces informations et justificatifs pour préparer et transmettre mon dossier à OSB, et j’accepte l’option à ${fmtXpf(PAYZEN_OPTION.fraisXpf)} par mois, facturée dès la validation du dossier.</label>
     <button class="btn" type="submit">Envoyer le dossier</button></form></div>`;
   return dash('Paiement carte', '/tableau-de-bord/osb', body);
 }
@@ -1289,7 +1289,7 @@ async function adminOsb(env, url) {
   const piecesOf = (d) => pieces.filter((x) => x.dossier_id === d.id).map((x) => `<a class="small" href="/admin/osb/piece/${x.id}">${esc(OSB_PIECES[x.nature] || x.nature)}</a>`).join('<br>');
   const body = `${flash(url)}<div class="card"><h1>Dossiers OSB</h1>${results.length ? `<div class="table-scroll"><table><thead><tr><th>Date</th><th>Boutique</th><th>Demandeur</th><th>Banque</th><th>Statut</th></tr></thead><tbody>
     ${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.boutique)}<br><span class="small muted">${esc(d.raison_sociale)} · ${esc(d.numero_tahiti || 's. n° Tahiti')}</span></td>
-      <td>${esc(d.responsable)}<br><span class="small muted">${esc(d.telephone)} · ${esc(d.email)}</span></td><td>${esc(d.banque)}${d.paiement_en_ligne ? `<br><span class="small">PayZen · ${fmtXpf(d.frais_xpf || 0)}</span>` : ''}<br>${piecesOf(d)}</td>
+      <td>${esc(d.responsable)}<br><span class="small muted">${esc(d.telephone)} · ${esc(d.email)}</span></td><td>${esc(d.banque)}${d.paiement_en_ligne ? `<br><span class="small">PayZen · ${fmtXpf(d.frais_xpf || 0)}/mois</span>` : ''}<br>${piecesOf(d)}</td>
       <td><form method="post" action="/admin/osb/${d.id}/statut" style="display:flex;gap:6px"><select name="statut" style="width:auto">${Object.entries(OSB_STATUTS).map(([k, v]) => `<option value="${k}" ${k === d.statut ? 'selected' : ''}>${v}</option>`).join('')}</select><button class="btn small ghost">OK</button></form></td></tr>`).join('')}
     </tbody></table></div>` : '<p class="muted">Aucun dossier.</p>'}</div>`;
   return html(appPage({ title: 'Dossiers OSB', body, nav: adminNav('/admin/osb'), brandHref: '/admin' }), 200, { 'cache-control': 'no-store' });
@@ -1298,11 +1298,34 @@ async function adminOsb(env, url) {
 async function adminOsbStatus(request, env, id) {
   const f = await readForm(request);
   const st = OSB_STATUTS[f.get('statut')] ? f.get('statut') : null;
+  let note = 'Dossier mis à jour.';
   if (st) {
-    const r = await env.DB.prepare('UPDATE dossiers_osb SET statut = ? WHERE id = ? RETURNING boutique_id').bind(st, id).first();
-    if (r) await audit(env, r.boutique_id, 'admin', 'osb.statut', st);
+    const r = await env.DB.prepare('UPDATE dossiers_osb SET statut = ? WHERE id = ? RETURNING boutique_id, paiement_en_ligne').bind(st, id).first();
+    if (r) {
+      await audit(env, r.boutique_id, 'admin', 'osb.statut', st);
+      // Dossier validé : l'option mensuelle PayZen est ajoutée à l'abonnement Stripe de la boutique.
+      if (st === 'valide' && r.paiement_en_ligne) note = await activerOptionPayzen(env, r.boutique_id);
+    }
   }
-  return redirect(withMsg('/admin/osb', 'ok', 'Dossier mis à jour.'));
+  return redirect(withMsg('/admin/osb', note.startsWith('⚠') ? 'err' : 'ok', note));
+}
+
+async function activerOptionPayzen(env, boutiqueId) {
+  const b = await env.DB.prepare('SELECT stripe_subscription_id FROM boutiques WHERE id = ?').bind(boutiqueId).first();
+  const price = env.STRIPE_PRICE_OPTION_PAYZEN;
+  if (!stripeReady(env) || !price || !b?.stripe_subscription_id) {
+    await audit(env, boutiqueId, 'admin', 'osb.option_a_facturer', 'Facturation manuelle requise');
+    return '⚠ Dossier validé, mais l’option PayZen n’a pas pu être ajoutée automatiquement (Stripe ou prix non configuré, ou boutique sans abonnement) : à facturer manuellement.';
+  }
+  try {
+    const r = await addSubscriptionItem(env, b.stripe_subscription_id, price);
+    await audit(env, boutiqueId, 'admin', 'osb.option_activee', r.deja ? 'déjà présente' : 'ajoutée à l’abonnement');
+    return r.deja ? 'Dossier validé. L’option PayZen était déjà sur l’abonnement.' : 'Dossier validé. Option PayZen ajoutée à l’abonnement.';
+  } catch (e) {
+    console.error('Option PayZen', e && e.message);
+    await audit(env, boutiqueId, 'admin', 'osb.option_echec', String(e && e.message).slice(0, 200));
+    return '⚠ Dossier validé, mais Stripe a refusé l’ajout de l’option PayZen : à vérifier.';
+  }
 }
 
 // ───────────────────────────── Tâche planifiée ─────────────────────────────
