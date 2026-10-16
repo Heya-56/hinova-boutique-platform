@@ -77,17 +77,19 @@ export async function verifyWebhook(payload, header, secret, toleranceSec = 300)
   return sigs.some((s) => s.length === expected.length && [...s].reduce((r, c, i) => r | (c.charCodeAt(0) ^ expected.charCodeAt(i)), 0) === 0);
 }
 
-// Ajout d'une option mensuelle (ligne supplémentaire) à un abonnement existant. Clé d'idempotence : un seul ajout par abonnement et prix.
-export async function addSubscriptionItem(env, subscription, price) {
+// Ajout d'une option (ligne supplémentaire) à un abonnement existant, au prix correspondant à sa périodicité.
+// prices = { month: 'price_…', year: 'price_…' }. Idempotent : rien n'est ajouté si l'option est déjà présente.
+export async function addSubscriptionItem(env, subscription, prices) {
   const sub = await getSubscription(env, subscription);
   const items = sub.items?.data || [];
-  if (items.some((it) => it.price?.id === price)) return { deja: true };
-  // Stripe refuse de mélanger des périodicités : une option mensuelle ne s'ajoute pas à un abonnement annuel.
-  if (items.some((it) => it.price?.recurring?.interval && it.price.recurring.interval !== 'month')) return { annuel: true };
+  if (items.some((it) => Object.values(prices).includes(it.price?.id))) return { deja: true };
+  const interval = items.find((it) => it.price?.recurring?.interval)?.price.recurring.interval || 'month';
+  const price = prices[interval];
+  if (!price) return { indisponible: interval };
   const init = { method: 'POST', headers: { authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, 'content-type': 'application/x-www-form-urlencoded', 'idempotency-key': `item-${subscription}-${price}` } };
   init.body = formEncode({ subscription, price, quantity: 1, proration_behavior: 'create_prorations' }).toString();
   const res = await fetch(API + '/subscription_items', init);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Stripe ${res.status} : ${data?.error?.message || 'erreur'}`);
-  return data;
+  return { ajout: interval };
 }

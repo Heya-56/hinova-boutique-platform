@@ -996,7 +996,7 @@ async function osbForm(env, url, b, who) {
     <input id="p_${k}" name="piece_${k}" type="file" accept="application/pdf,image/jpeg,image/png" ${k === 'autre' ? '' : 'required'}>`;
   const body = `${flash(url)}<div class="card"><h1>Paiement en ligne par carte (OSB / PayZen)</h1>
     <p>Pour accepter la carte bancaire, votre boutique a besoin d’un contrat de paiement en ligne OSB, ouvert à votre nom, adossé à un compte professionnel à la <b>Banque de Polynésie</b> ou à la <b>Socredo</b>. Remplissez ce dossier avec les justificatifs : nous le vérifions et le transmettons à OSB.</p>
-    <p><b>Option paiement en ligne : ${fmtXpf(PAYZEN_OPTION.fraisXpf)} par mois</b>, ajoutée à votre abonnement Hinova une fois le dossier validé par OSB. Vous pouvez l’arrêter à tout moment depuis « Gérer mon abonnement ».</p>
+    <p><b>Option paiement en ligne : ${fmtXpf(PAYZEN_OPTION.fraisXpf)} par mois</b> (ou ${fmtXpf(PAYZEN_OPTION.annuelXpf)} par an si votre abonnement est annuel), ajoutée à votre abonnement Hinova une fois le dossier validé par OSB. Vous pouvez l’arrêter à tout moment depuis « Gérer mon abonnement ».</p>
     <p class="small muted">Le contrat et l’abonnement OSB sont réglés directement par vous à OSB ; ils ne sont pas inclus dans votre formule Hinova. Les sommes payées par vos clients arrivent sur votre compte, jamais chez Hinova.</p></div>
   ${results.length ? `<div class="card"><h2>Mes demandes</h2><table><tbody>${results.map((d) => `<tr><td>${fmtDate(d.cree_le)}</td><td>${esc(d.raison_sociale)}<br>${piecesOf(d)}</td><td><span class="badge ${esc(d.statut)}">${esc(OSB_STATUTS[d.statut] || d.statut)}</span></td></tr>`).join('')}</tbody></table></div>` : ''}
   <div class="card"><h2>Nouvelle demande</h2><form method="post" enctype="multipart/form-data">
@@ -1312,18 +1312,18 @@ async function adminOsbStatus(request, env, id) {
 
 async function activerOptionPayzen(env, boutiqueId) {
   const b = await env.DB.prepare('SELECT stripe_subscription_id FROM boutiques WHERE id = ?').bind(boutiqueId).first();
-  const price = env.STRIPE_PRICE_OPTION_PAYZEN;
-  if (!stripeReady(env) || !price || !b?.stripe_subscription_id) {
+  const prices = { month: env.STRIPE_PRICE_OPTION_PAYZEN, year: env.STRIPE_PRICE_OPTION_PAYZEN_ANNUEL };
+  if (!stripeReady(env) || !prices.month || !b?.stripe_subscription_id) {
     await audit(env, boutiqueId, 'admin', 'osb.option_a_facturer', 'Facturation manuelle requise');
     return '⚠ Dossier validé, mais l’option PayZen n’a pas pu être ajoutée automatiquement (Stripe ou prix non configuré, ou boutique sans abonnement) : à facturer manuellement.';
   }
   try {
-    const r = await addSubscriptionItem(env, b.stripe_subscription_id, price);
-    if (r.annuel) {
-      await audit(env, boutiqueId, 'admin', 'osb.option_a_facturer', 'Abonnement annuel : option mensuelle à facturer à part');
-      return '⚠ Dossier validé. Abonnement annuel : l’option PayZen mensuelle ne peut pas y être ajoutée, à facturer à part.';
+    const r = await addSubscriptionItem(env, b.stripe_subscription_id, prices);
+    if (r.indisponible) {
+      await audit(env, boutiqueId, 'admin', 'osb.option_a_facturer', `Aucun prix d'option pour la périodicité ${r.indisponible}`);
+      return '⚠ Dossier validé, mais aucun prix PayZen ne correspond à la périodicité de cet abonnement : à facturer à part.';
     }
-    await audit(env, boutiqueId, 'admin', 'osb.option_activee', r.deja ? 'déjà présente' : 'ajoutée à l’abonnement');
+    await audit(env, boutiqueId, 'admin', 'osb.option_activee', r.deja ? 'déjà présente' : `ajoutée (${r.ajout === 'year' ? 'annuelle' : 'mensuelle'})`);
     return r.deja ? 'Dossier validé. L’option PayZen était déjà sur l’abonnement.' : 'Dossier validé. Option PayZen ajoutée à l’abonnement.';
   } catch (e) {
     console.error('Option PayZen', e && e.message);
