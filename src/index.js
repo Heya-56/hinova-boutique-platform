@@ -965,7 +965,7 @@ async function orderAdvance(env, b, id) {
       ON CONFLICT(boutique_id) DO UPDATE SET dernier_numero = dernier_numero + 1 RETURNING dernier_numero`).bind(b.id).first();
     const numero = `F${yearKey()}-${String(n).padStart(4, '0')}`;
     await env.DB.batch([
-      env.DB.prepare('UPDATE commandes SET numero_facture = ? WHERE id = ? AND numero_facture IS NULL').bind(numero, id),
+      env.DB.prepare('UPDATE commandes SET numero_facture = ? WHERE id = ? AND boutique_id = ? AND numero_facture IS NULL').bind(numero, id, b.id),
       env.DB.prepare(`INSERT INTO ventes_mensuelles (boutique_id, mois, ventes_count) VALUES (?, ?, 1)
         ON CONFLICT(boutique_id, mois) DO UPDATE SET ventes_count = ventes_count + 1`).bind(b.id, monthKey()),
     ]);

@@ -81,6 +81,11 @@ check "stock réservé (3 → 1)" 'curl -s -b "$J" $BASE/tableau-de-bord/produit
 check "surcommande refusée" '[[ "$(loc "${H[@]}" -X POST $BASE/b/$SLUG/commander -d q_$OID=5 -d client_nom=A -d client_telephone=1 -d client_email=a@b.pf -d client_adresse=B -d ile=Tahiti -d moyen=virement)" == *Stock* ]]'
 check "moyen non proposé refusé" '[[ "$(loc "${H[@]}" -X POST $BASE/b/$SLUG/commander -d q_$OID=1 -d client_nom=A -d client_telephone=1 -d client_email=a@b.pf -d client_adresse=B -d ile=Tahiti -d moyen=carte)" == *err=* ]]'
 check "un autre commerçant ne voit pas la commande" '[ "$(code -b "$J2" $BASE/tableau-de-bord/commandes/$CMD)" = 404 ]'
+curl -s -o /dev/null -b "$J2" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/$CMD/avancer"
+curl -s -o /dev/null -b "$J2" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/$CMD/supprimer"
+check "un autre commerçant ne peut ni avancer ni supprimer la commande" '[ "$(code -b "$J" $BASE/tableau-de-bord/commandes/$CMD)" = 200 ] && ! curl -s -b "$J2" $BASE/tableau-de-bord/commandes | grep -q "$CMD"'
+curl -s -o /dev/null -b "$J2" "${H[@]}" -X POST "$BASE/tableau-de-bord/produits/$P2/supprimer"
+check "un autre commerçant ne peut pas supprimer un produit" '[ "$(code -b "$J" $BASE/tableau-de-bord/produits/$P2)" = 200 ]'
 check "pas de facture avant paiement" '[ "$(code $BASE/f/$CMD)" = 404 ]'
 curl -s -o /dev/null -b "$J" "${H[@]}" -X POST "$BASE/tableau-de-bord/commandes/$CMD/avancer"
 Y=$(TZ=Pacific/Tahiti date +%Y)
